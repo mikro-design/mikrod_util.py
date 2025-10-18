@@ -49,7 +49,7 @@ Python 3.7+ required.
 The server will:
 - Initialize the SQLite database
 - Start on port 8080
-- Display your local IP address for Android app configuration
+- Display both local and public IP addresses for Android app configuration
 - Show supported sensor types
 
 Example output:
@@ -58,12 +58,18 @@ Example output:
 🚀 BLE Gateway Server Starting...
 ============================================================
 
-Local IP: 192.168.1.100
+🌐 Network Information:
+   Local IP:  192.168.1.100
+   Public IP: 203.0.113.45
 
-📊 Web Interface: http://192.168.1.100:8080
-🔌 API Endpoint:  http://192.168.1.100:8080/api/ble
+📊 Web Interface:
+   Local:  http://192.168.1.100:8080
+   Public: http://203.0.113.45:8080
 
-Set this URL in your Android app's Gateway Mode configuration
+🔌 API Endpoint (for Android app):
+   Local network:  http://192.168.1.100:8080/api/ble
+   Internet:       http://203.0.113.45:8080/api/ble
+   (Requires port forwarding if accessing from internet)
 ============================================================
 
 📡 Supported sensor types:
@@ -75,6 +81,13 @@ Set this URL in your Android app's Gateway Mode configuration
 💾 Database:   ble_gateway.db
 ============================================================
 ```
+
+### Network Configuration
+
+- **Local network**: Use the local IP address if the Android app is on the same WiFi network
+- **Internet access**: Use the public IP address, but you'll need to:
+  1. Configure port forwarding on your router (forward port 8080 to your local IP)
+  2. Ensure your firewall allows incoming connections on port 8080
 
 ### Viewing the Dashboard
 
@@ -253,9 +266,16 @@ Nested fields are also supported:
 
 ## Android App Configuration
 
-Set the gateway endpoint URL in your Android BLE scanning app:
+Set the gateway endpoint URL in your Android BLE scanning app. The server displays both local and public IP addresses on startup.
+
+**For local network (same WiFi):**
 ```
-http://YOUR_PC_IP:8080/api/ble
+http://LOCAL_IP:8080/api/ble
+```
+
+**For internet access (requires port forwarding):**
+```
+http://PUBLIC_IP:8080/api/ble
 ```
 
 The app should POST JSON arrays of device objects to this endpoint.

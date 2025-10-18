@@ -422,6 +422,7 @@ def get_devices():
 
 if __name__ == '__main__':
     import socket
+    import urllib.request
 
     # Initialize database
     logger.info("Initializing database...")
@@ -433,13 +434,32 @@ if __name__ == '__main__':
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
 
+    # Get public IP address
+    public_ip = None
+    try:
+        logger.info("Fetching public IP address...")
+        with urllib.request.urlopen('https://api.ipify.org', timeout=5) as response:
+            public_ip = response.read().decode('utf-8')
+        logger.info(f"Public IP: {public_ip}")
+    except Exception as e:
+        logger.warning(f"Could not fetch public IP: {e}")
+        public_ip = "Unable to fetch"
+
     print("\n" + "=" * 60)
     print("🚀 BLE Gateway Server Starting...")
     print("=" * 60)
-    print(f"\nLocal IP: {local_ip}")
-    print(f"\n📊 Web Interface: http://{local_ip}:8080")
-    print(f"🔌 API Endpoint:  http://{local_ip}:8080/api/ble")
-    print("\nSet this URL in your Android app's Gateway Mode configuration")
+    print(f"\n🌐 Network Information:")
+    print(f"   Local IP:  {local_ip}")
+    print(f"   Public IP: {public_ip}")
+    print("\n📊 Web Interface:")
+    print(f"   Local:  http://{local_ip}:8080")
+    if public_ip and public_ip != "Unable to fetch":
+        print(f"   Public: http://{public_ip}:8080")
+    print("\n🔌 API Endpoint (for Android app):")
+    print(f"   Local network:  http://{local_ip}:8080/api/ble")
+    if public_ip and public_ip != "Unable to fetch":
+        print(f"   Internet:       http://{public_ip}:8080/api/ble")
+        print("   (Requires port forwarding if accessing from internet)")
     print("=" * 60)
     print(f"\n📡 Supported sensor types:")
     sensor_types = sorted(set(v['type'] for v in SENSOR_PATTERNS.values()))
