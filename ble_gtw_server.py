@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BLE Gateway Server - Receives BLE device data from the Android app
+BLE Gateway Server - Receives BLE device data from the Android app via MQTT or HTTP
 """
 from flask import Flask, request, jsonify, render_template_string
 from datetime import datetime
@@ -10,11 +10,29 @@ import re
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+import threading
 
 app = Flask(__name__)
 
 # Database file
 DB_FILE = 'ble_gateway.db'
+CONNECTION_ID_FILE = 'connection_id.txt'  # Stores the unique connection ID
+
+# MQTT Configuration (HiveMQ Cloud or any MQTT broker)
+MQTT_BROKER = "broker.hivemq.com"  # Free HiveMQ public broker
+MQTT_PORT = 1883  # TCP port for Python client
+MQTT_WEBSOCKET_PORT = 8000  # WebSocket port for React Native app
+# For HiveMQ Cloud with authentication, set these:
+MQTT_USERNAME = None  # Set to your username if using HiveMQ Cloud
+MQTT_PASSWORD = None  # Set to your password if using HiveMQ Cloud
+MQTT_USE_TLS = False  # Set to True if using HiveMQ Cloud
+
+# Connection ID will be loaded/generated at startup
+MQTT_CONNECTION_ID = None
+MQTT_TOPIC = None
+MQTT_CLIENT_ID = None
+
+mqtt_client = None
 
 # Store received data in memory
 latest_data = {
@@ -23,20 +41,7 @@ latest_data = {
     'count': 0
 }
 
-# SI Unit field mappings (field name patterns -> unit)
-SENSOR_PATTERNS = {
-    'temperature|temp|t(?!ime)': {'unit': '°C', 'type': 'temperature'},
-    'humidity|hum|rh': {'unit': '%', 'type': 'humidity'},
-    'pressure|press|p(?!m)': {'unit': 'hPa', 'type': 'pressure'},
-    'battery|bat': {'unit': '%', 'type': 'battery'},
-    'voltage|volt|v': {'unit': 'V', 'type': 'voltage'},
-    'current|i': {'unit': 'A', 'type': 'current'},
-    'light|lux|illuminance': {'unit': 'lux', 'type': 'light'},
-    'co2': {'unit': 'ppm', 'type': 'co2'},
-    'voc': {'unit': 'ppb', 'type': 'voc'},
-    'pm2\.?5|pm25': {'unit': 'µg/m³', 'type': 'pm25'},
-    'pm10': {'unit': 'µg/m³', 'type': 'pm10'},
-}
+# Server just stores raw data - plotting tool handles sensor detection
 
 # HTML template for viewing the data
 HTML_TEMPLATE = """
@@ -170,7 +175,7 @@ HTML_TEMPLATE = """
             <h2>No devices received yet</h2>
             <p>Waiting for data from BLE Gateway...</p>
             <p>Make sure Gateway Mode is enabled on the app and the endpoint URL is set to:</p>
-            <code>http://YOUR_PC_IP:8080/api/ble</code>
+            <code>https://YOUR_PC_IP:8443/api/ble</code>
         </div>
     {% endif %}
 </body>
@@ -263,45 +268,12 @@ def init_database():
     conn.close()
 
 
-def detect_sensors(data):
-    """
-    Detect sensor fields in JSON data and extract values with units
-    Returns: list of dict with {type, value, unit, field_name}
-    """
-    sensors = []
-
-    def scan_dict(obj, prefix=''):
-        """Recursively scan dictionary for sensor fields"""
-        if not isinstance(obj, dict):
-            return
-
-        for key, value in obj.items():
-            full_key = f"{prefix}.{key}" if prefix else key
-
-            # Skip non-numeric values
-            if not isinstance(value, (int, float)):
-                if isinstance(value, dict):
-                    scan_dict(value, full_key)
-                continue
-
-            # Check against sensor patterns
-            key_lower = key.lower()
-            for pattern, info in SENSOR_PATTERNS.items():
-                if re.search(pattern, key_lower, re.IGNORECASE):
-                    sensors.append({
-                        'type': info['type'],
-                        'value': float(value),
-                        'unit': info['unit'],
-                        'field_name': full_key
-                    })
-                    break
-
-    scan_dict(data)
-    return sensors
+# Sensor detection removed - plotting tool handles this
+# Server just stores raw data
 
 
 def save_to_database(device_id, device_name, rssi, advertising_data):
-    """Save device reading and sensor data to database"""
+    """Save device reading to database (raw data only)"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
@@ -312,22 +284,10 @@ def save_to_database(device_id, device_name, rssi, advertising_data):
             VALUES (?, ?, ?, ?)
         ''', (device_id, device_name, rssi, json.dumps(advertising_data)))
 
-        reading_id = cursor.lastrowid
-
-        # Detect and save sensor data
-        sensors = detect_sensors(advertising_data)
-        for sensor in sensors:
-            cursor.execute('''
-                INSERT INTO sensor_data (reading_id, sensor_type, sensor_value, unit)
-                VALUES (?, ?, ?, ?)
-            ''', (reading_id, sensor['type'], sensor['value'], sensor['unit']))
-
         conn.commit()
 
         # Log database write
-        logger.debug(f"Saved to DB: {device_name} ({device_id}) - {len(sensors)} sensors")
-
-        return sensors
+        logger.debug(f"Saved to DB: {device_name} ({device_id})")
 
     except Exception as e:
         conn.rollback()
@@ -348,15 +308,12 @@ def index():
     )
 
 
-@app.route('/api/ble', methods=['POST'])
-def receive_ble_data():
-    """Receive BLE device data from the gateway"""
+def process_ble_data(data, source="HTTP"):
+    """Process BLE device data from any source (HTTP or MQTT)"""
     try:
-        data = request.get_json()
-
         if not data:
-            logger.warning("Received empty request")
-            return jsonify({'error': 'No data received'}), 400
+            logger.warning(f"Received empty data from {source}")
+            return {'error': 'No data received'}, 400
 
         # Update stored data
         latest_data['devices'] = data
@@ -365,10 +322,9 @@ def receive_ble_data():
 
         # Log incoming data
         logger.info("=" * 60)
-        logger.info(f"📡 INCOMING DATA - {len(data)} device(s)")
+        logger.info(f"📡 INCOMING DATA ({source}) - {len(data)} device(s)")
         logger.info("=" * 60)
 
-        total_sensors = 0
         for idx, device in enumerate(data, 1):
             device_id = device.get('id', 'unknown')
             device_name = device.get('name', 'Unknown')
@@ -384,33 +340,117 @@ def receive_ble_data():
             if advertising:
                 logger.debug(f"  Raw advertising data: {json.dumps(advertising, indent=2)}")
 
-            # Save to database and detect sensors
-            sensors = save_to_database(device_id, device_name, rssi, advertising)
-
-            # Log detected sensors
-            if sensors:
-                logger.info(f"  Sensors detected: {len(sensors)}")
-                for sensor in sensors:
-                    logger.info(f"    • {sensor['type']}: {sensor['value']} {sensor['unit']} (from field: {sensor['field_name']})")
-                total_sensors += len(sensors)
-            else:
-                logger.info("  No sensors detected in advertising data")
+            # Save to database (raw data only)
+            save_to_database(device_id, device_name, rssi, advertising)
 
             logger.info("")  # Blank line between devices
 
         # Summary
-        logger.info(f"✓ Successfully processed {len(data)} device(s), {total_sensors} total sensor reading(s)")
+        logger.info(f"✓ Successfully processed {len(data)} device(s)")
         logger.info("=" * 60)
 
-        return jsonify({
+        return {
             'status': 'success',
             'received': len(data),
-            'sensors_detected': total_sensors,
             'timestamp': latest_data['timestamp']
-        }), 200
+        }, 200
 
     except Exception as e:
-        logger.error(f"❌ Error processing data: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error processing data from {source}: {str(e)}", exc_info=True)
+        return {'error': str(e)}, 500
+
+
+def on_mqtt_connect(client, userdata, flags, rc):
+    """Callback when MQTT client connects to broker"""
+    if rc == 0:
+        logger.info(f"✓ Connected to MQTT broker: {MQTT_BROKER}")
+        client.subscribe(MQTT_TOPIC)
+        logger.info(f"✓ Subscribed to topic: {MQTT_TOPIC}")
+        logger.info(f"  (1:1 private connection)")
+    else:
+        logger.error(f"❌ Failed to connect to MQTT broker, return code: {rc}")
+
+
+def on_mqtt_message(client, userdata, msg):
+    """Callback when MQTT message is received"""
+    try:
+        payload = msg.payload.decode('utf-8')
+        data = json.loads(payload)
+
+        # Process the data (same as HTTP endpoint)
+        if isinstance(data, list):
+            process_ble_data(data, source="MQTT")
+        else:
+            logger.warning(f"MQTT message is not a list: {type(data)}")
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Invalid JSON in MQTT message: {e}")
+    except Exception as e:
+        logger.error(f"❌ Error processing MQTT message: {e}", exc_info=True)
+
+
+def on_mqtt_disconnect(client, userdata, rc):
+    """Callback when MQTT client disconnects"""
+    if rc != 0:
+        logger.warning(f"⚠️  Unexpected MQTT disconnection. Attempting to reconnect...")
+
+
+def setup_mqtt():
+    """Setup and start MQTT client"""
+    global mqtt_client
+
+    try:
+        import paho.mqtt.client as mqtt
+
+        # Support both paho-mqtt v1.x and v2.0
+        try:
+            # Try v2.0 style (with callback_api_version)
+            mqtt_client = mqtt.Client(
+                client_id=MQTT_CLIENT_ID,
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION1
+            )
+        except (AttributeError, TypeError):
+            # Fallback to v1.x style
+            mqtt_client = mqtt.Client(MQTT_CLIENT_ID)
+
+        mqtt_client.on_connect = on_mqtt_connect
+        mqtt_client.on_message = on_mqtt_message
+        mqtt_client.on_disconnect = on_mqtt_disconnect
+
+        # Set username and password if provided
+        if MQTT_USERNAME and MQTT_PASSWORD:
+            mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+        # Enable TLS if required
+        if MQTT_USE_TLS:
+            mqtt_client.tls_set()
+
+        logger.info(f"Connecting to MQTT broker: {MQTT_BROKER}:{MQTT_PORT}")
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+
+        # Start the MQTT loop in a separate thread
+        mqtt_thread = threading.Thread(target=mqtt_client.loop_forever, daemon=True)
+        mqtt_thread.start()
+
+        return True
+
+    except ImportError:
+        logger.warning("⚠️  paho-mqtt not installed. MQTT support disabled.")
+        logger.warning("   Install with: pip install paho-mqtt")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Failed to setup MQTT: {e}")
+        return False
+
+
+@app.route('/api/ble', methods=['POST'])
+def receive_ble_data():
+    """Receive BLE device data from the gateway via HTTP"""
+    try:
+        data = request.get_json()
+        result, status_code = process_ble_data(data, source="HTTP")
+        return jsonify(result), status_code
+    except Exception as e:
+        logger.error(f"❌ Error in HTTP endpoint: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -418,6 +458,118 @@ def receive_ble_data():
 def get_devices():
     """Get the latest device data as JSON"""
     return jsonify(latest_data)
+
+
+def generate_ssl_certificate():
+    """Generate self-signed SSL certificate if it doesn't exist"""
+    cert_file = Path('cert.pem')
+    key_file = Path('key.pem')
+
+    if cert_file.exists() and key_file.exists():
+        logger.info("SSL certificates found")
+        return str(cert_file), str(key_file)
+
+    logger.info("Generating self-signed SSL certificate...")
+
+    try:
+        # Try using cryptography library (more portable)
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+        import datetime
+
+        # Generate private key
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=4096,
+        )
+
+        # Create certificate
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, u"US"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"BLE Gateway Server"),
+            x509.NameAttribute(NameOID.COMMON_NAME, u"BLE-Gateway"),
+        ])
+
+        cert = x509.CertificateBuilder().subject_name(
+            subject
+        ).issuer_name(
+            issuer
+        ).public_key(
+            private_key.public_key()
+        ).serial_number(
+            x509.random_serial_number()
+        ).not_valid_before(
+            datetime.datetime.utcnow()
+        ).not_valid_after(
+            datetime.datetime.utcnow() + datetime.timedelta(days=365)
+        ).sign(private_key, hashes.SHA256())
+
+        # Write private key
+        with open(key_file, 'wb') as f:
+            f.write(private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+
+        # Write certificate
+        with open(cert_file, 'wb') as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+        logger.info(f"✓ SSL certificate generated: {cert_file.absolute()}")
+        logger.info(f"✓ SSL key generated: {key_file.absolute()}")
+
+    except ImportError:
+        # Fallback to openssl command
+        logger.info("cryptography library not found, using openssl command...")
+        import subprocess
+
+        result = subprocess.run([
+            'openssl', 'req', '-x509', '-newkey', 'rsa:4096',
+            '-nodes', '-out', str(cert_file), '-keyout', str(key_file),
+            '-days', '365',
+            '-subj', '/CN=BLE-Gateway/O=BLE Gateway Server/C=US'
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise Exception(f"Failed to generate certificate: {result.stderr}")
+
+        logger.info(f"✓ SSL certificate generated: {cert_file.absolute()}")
+        logger.info(f"✓ SSL key generated: {key_file.absolute()}")
+
+    return str(cert_file), str(key_file)
+
+
+def generate_new_connection_id():
+    """Generate a fresh connection ID on every server start"""
+    global MQTT_CONNECTION_ID, MQTT_TOPIC, MQTT_CLIENT_ID
+
+    import secrets
+    import time
+
+    # Generate new connection ID with timestamp for uniqueness (8 chars + timestamp hash)
+    random_part = secrets.token_urlsafe(6)  # ~8 chars
+    timestamp_part = hex(int(time.time()))[2:6]  # 4 hex chars from timestamp
+    MQTT_CONNECTION_ID = f"{random_part}{timestamp_part}"
+
+    logger.info(f"🔄 Generated NEW connection ID: {MQTT_CONNECTION_ID}")
+    logger.info(f"   Fresh MQTT topic created - old connections are now invalid")
+
+    # Set topic and client ID
+    MQTT_TOPIC = f"mikrodesign/ble_scan/{MQTT_CONNECTION_ID}"
+    MQTT_CLIENT_ID = f"ble_gtw_{MQTT_CONNECTION_ID}"
+
+    # Save to file for reference only (not used for loading)
+    conn_id_path = Path(CONNECTION_ID_FILE)
+    with open(conn_id_path, 'w') as f:
+        f.write(f"{MQTT_CONNECTION_ID}\n")
+        f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Topic: {MQTT_TOPIC}\n")
+
+    return MQTT_CONNECTION_ID
 
 
 if __name__ == '__main__':
@@ -430,9 +582,24 @@ if __name__ == '__main__':
     logger.info(f"Database: {Path(DB_FILE).absolute()}")
     logger.info(f"Log file: {Path('ble_gateway.log').absolute()}")
 
-    # Get local IP address
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
+    # Generate fresh connection ID for this session
+    connection_id = generate_new_connection_id()
+
+    # Generate or check SSL certificates
+    cert_file, key_file = generate_ssl_certificate()
+
+    # Get local IP address (actual network IP, not loopback)
+    try:
+        # Create a socket to determine which interface would be used to reach the internet
+        # This doesn't actually send any data
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        # Fallback to hostname method
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
 
     # Get public IP address
     public_ip = None
@@ -445,26 +612,79 @@ if __name__ == '__main__':
         logger.warning(f"Could not fetch public IP: {e}")
         public_ip = "Unable to fetch"
 
+    # Setup MQTT
+    mqtt_enabled = setup_mqtt()
+
     print("\n" + "=" * 60)
     print("🚀 BLE Gateway Server Starting...")
     print("=" * 60)
+
+    # MQTT Configuration
+    print(f"\n📬 MQTT Configuration:")
+    if mqtt_enabled:
+        print(f"   ✓ MQTT Enabled")
+        print(f"   Broker: {MQTT_BROKER}:{MQTT_PORT} (Server)")
+        print(f"   App Port: {MQTT_WEBSOCKET_PORT} (WebSocket)")
+        print(f"   Connection ID: {connection_id}")
+        print(f"   Topic: {MQTT_TOPIC}")
+        if MQTT_USE_TLS:
+            print(f"   TLS: Enabled")
+        print(f"\n   🔒 This is a 1:1 private connection")
+        print(f"   🔄 Fresh connection ID generated on each restart")
+        print(f"   💡 Scan the NEW QR code to reconnect your phone")
+
+        # Generate QR code with MQTT configuration
+        import qrcode
+
+        # Create configuration JSON for Android app
+        mqtt_config = {
+            "broker": MQTT_BROKER,
+            "port": MQTT_WEBSOCKET_PORT,  # Use WebSocket port for React Native app
+            "topic": MQTT_TOPIC,
+            "connection_id": connection_id,
+            "tls": MQTT_USE_TLS
+        }
+        if MQTT_USERNAME:
+            mqtt_config["username"] = MQTT_USERNAME
+        if MQTT_PASSWORD:
+            mqtt_config["password"] = MQTT_PASSWORD
+
+        config_json = json.dumps(mqtt_config)
+
+        # Generate QR code
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(config_json)
+        qr.make()
+
+        print(f"\n   📱 Scan this QR code with your Android app:")
+        print()
+        qr.print_ascii(invert=True)
+        print()
+        print(f"   ✓ Instant 1:1 connection setup!")
+
+        print(f"\n   📱 Or configure manually:")
+        print(f"      Broker: {MQTT_BROKER}")
+        print(f"      Port: {MQTT_WEBSOCKET_PORT} (WebSocket)")
+        print(f"      Topic: {MQTT_TOPIC}")
+    else:
+        print(f"   ✗ MQTT Disabled (paho-mqtt not installed)")
+        print(f"   Install with: pip install paho-mqtt")
+
     print(f"\n🌐 Network Information:")
     print(f"   Local IP:  {local_ip}")
     print(f"   Public IP: {public_ip}")
     print("\n📊 Web Interface:")
-    print(f"   Local:  http://{local_ip}:8080")
+    print(f"   Local:  https://{local_ip}:8443")
     if public_ip and public_ip != "Unable to fetch":
-        print(f"   Public: http://{public_ip}:8080")
-    print("\n🔌 API Endpoint (for Android app):")
-    print(f"   Local network:  http://{local_ip}:8080/api/ble")
+        print(f"   Public: https://{public_ip}:8443")
+    print("\n🔌 HTTP API Endpoint (optional fallback):")
+    print(f"   Local network:  https://{local_ip}:8443/api/ble")
     if public_ip and public_ip != "Unable to fetch":
-        print(f"   Internet:       http://{public_ip}:8080/api/ble")
+        print(f"   Internet:       https://{public_ip}:8443/api/ble")
         print("   (Requires port forwarding if accessing from internet)")
-    print("=" * 60)
-    print(f"\n📡 Supported sensor types:")
-    sensor_types = sorted(set(v['type'] for v in SENSOR_PATTERNS.values()))
-    for i in range(0, len(sensor_types), 4):
-        print(f"   {', '.join(sensor_types[i:i+4])}")
+    print("\n🔒 Security:")
+    print(f"   Using self-signed certificate for HTTPS")
+    print(f"   ⚠️  You'll need to accept security warnings or install cert on Android")
     print("=" * 60)
     print(f"📝 Logging to: ble_gateway.log")
     print("💾 Database:   ble_gateway.db")
@@ -477,4 +697,9 @@ if __name__ == '__main__':
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.WARNING)
 
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    # Run with HTTPS using SSL context
+    import ssl
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain(cert_file, key_file)
+
+    app.run(host='0.0.0.0', port=8443, ssl_context=ssl_context, debug=False)
