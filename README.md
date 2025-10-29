@@ -1,10 +1,13 @@
 # BLE Gateway Server
 
-A Flask-based server for receiving and logging Bluetooth Low Energy (BLE) device data from Android apps, with automatic sensor detection and data visualization.
+A Flask-based server for receiving and logging Bluetooth Low Energy (BLE) device data from Android apps via MQTT or HTTPS, with automatic sensor detection and data visualization.
 
 ## Features
 
-- **Real-time BLE Data Reception**: Receives device data from Android gateway apps via REST API
+- **MQTT Support**: Receive data via MQTT (HiveMQ) - works anywhere without port forwarding!
+- **HTTPS Encrypted Communication**: Automatic SSL certificate generation and HTTPS support
+- **Android 9+ Compatible**: Works with modern Android security requirements
+- **Dual Communication Methods**: MQTT (recommended) or direct HTTP REST API
 - **Automatic Sensor Detection**: Automatically detects and parses common SI unit sensors:
   - Temperature (°C)
   - Humidity (%)
@@ -26,10 +29,15 @@ A Flask-based server for receiving and logging Bluetooth Low Energy (BLE) device
 ### Requirements
 
 ```bash
-pip install flask matplotlib
+pip install flask matplotlib cryptography paho-mqtt 'qrcode[pil]'
 ```
 
 Python 3.7+ required.
+
+**Notes**:
+- The `cryptography` library is recommended for automatic SSL certificate generation. If not available, the server will fall back to using the `openssl` command-line tool.
+- `paho-mqtt` is required for MQTT support (recommended). The server will work without it but only via HTTP.
+- `qrcode[pil]` enables QR code generation for instant Android app setup (required for MQTT).
 
 ### Files
 
@@ -37,6 +45,9 @@ Python 3.7+ required.
 - `plot_sensors.py` - Data visualization tool
 - `ble_gateway.db` - SQLite database (auto-created)
 - `ble_gateway.log` - Log file (auto-created)
+- `connection_id.txt` - Current connection ID (auto-generated each restart, for reference only)
+- `cert.pem` - SSL certificate (auto-generated)
+- `key.pem` - SSL private key (auto-generated)
 
 ## Usage
 
@@ -48,8 +59,10 @@ Python 3.7+ required.
 
 The server will:
 - Initialize the SQLite database
-- Start on port 8080
-- Display both local and public IP addresses for Android app configuration
+- Connect to MQTT broker (if paho-mqtt is installed)
+- Generate SSL certificates automatically (if not present)
+- Start on port 8443 with HTTPS
+- Display both MQTT and HTTP endpoints for Android app configuration
 - Show supported sensor types
 
 Example output:
@@ -58,18 +71,36 @@ Example output:
 🚀 BLE Gateway Server Starting...
 ============================================================
 
+📬 MQTT Configuration:
+   ✓ MQTT Enabled
+   Broker: broker.hivemq.com:1883
+   Server subscribed to: mikrodesign/ble_scan/+
+
+   📱 Configure your Android app to publish to:
+      Topic: mikrodesign/ble_scan/<gateway_id>
+      Examples:
+        - mikrodesign/ble_scan/phone1
+        - mikrodesign/ble_scan/home
+        - mikrodesign/ble_scan/office
+
+   💡 Use a simple, unique gateway_id for each device
+
 🌐 Network Information:
    Local IP:  192.168.1.100
    Public IP: 203.0.113.45
 
 📊 Web Interface:
-   Local:  http://192.168.1.100:8080
-   Public: http://203.0.113.45:8080
+   Local:  https://192.168.1.100:8443
+   Public: https://203.0.113.45:8443
 
-🔌 API Endpoint (for Android app):
-   Local network:  http://192.168.1.100:8080/api/ble
-   Internet:       http://203.0.113.45:8080/api/ble
+🔌 HTTP API Endpoint (optional fallback):
+   Local network:  https://192.168.1.100:8443/api/ble
+   Internet:       https://203.0.113.45:8443/api/ble
    (Requires port forwarding if accessing from internet)
+
+🔒 Security:
+   Using self-signed certificate for HTTPS
+   ⚠️  You'll need to accept security warnings or install cert on Android
 ============================================================
 
 📡 Supported sensor types:
@@ -82,16 +113,89 @@ Example output:
 ============================================================
 ```
 
+### HTTPS and SSL Certificates
+
+The server automatically generates a self-signed SSL certificate on first run. This provides:
+- ✅ Encrypted communication
+- ✅ Compatibility with Android 9+ (which blocks cleartext HTTP)
+- ✅ Automatic certificate management
+
+**Certificate files** (auto-generated):
+- `cert.pem` - SSL certificate
+- `key.pem` - Private key
+
+**For Android apps**, you have two options:
+
+#### Option 1: Accept Security Warning (Quick Testing)
+Your Android app will show a security warning about the untrusted certificate. You can bypass this in your app's development settings.
+
+#### Option 2: Install Certificate on Android Device (Recommended)
+1. Copy `cert.pem` from the server to your Android device
+2. Go to **Settings → Security → Install certificates from storage**
+3. Select `cert.pem` and install it
+4. The app will now trust the connection without warnings
+
+**Note**: Certificates are valid for 365 days. Delete both `.pem` files to regenerate new certificates.
+
+### MQTT Configuration (Recommended)
+
+MQTT is the recommended way to connect your Android app to the server. It works anywhere with internet access, requires no port forwarding, and is more reliable than direct HTTP connections.
+
+**Automatic 1:1 Connection with Fresh Keys:**
+
+The server automatically generates a **NEW** unique connection ID on **every restart**. This ensures maximum security - old connections become invalid and you get a fresh, private MQTT topic each time.
+
+- Broker: `broker.hivemq.com` (free public broker)
+- Port: `1883` (server), `8000` (WebSocket for mobile)
+- Connection ID: Auto-generated on each restart (e.g., `xK3pQz8A7f2e`)
+- Topic: `mikrodesign/ble_scan/{connection_id}`
+- Previous connections: Automatically invalidated on restart
+
+**No configuration needed!** Just run the server and scan the NEW QR code each time.
+
+**For Production (HiveMQ Cloud):**
+
+If you want private, authenticated MQTT, sign up for a free HiveMQ Cloud account at https://www.hivemq.com/mqtt-cloud-broker/
+
+Then edit the MQTT configuration at the top of `ble_gtw_server.py`:
+
+```python
+MQTT_BROKER = "your-instance.hivemq.cloud"  # Your HiveMQ Cloud URL
+MQTT_PORT = 8883
+MQTT_TOPIC_BASE = "mikrodesign/ble_scan"  # Keep the same or change if needed
+MQTT_USERNAME = "your_username"
+MQTT_PASSWORD = "your_password"
+MQTT_USE_TLS = True
+```
+
+**Android App Configuration:**
+
+Configure your Android app to publish BLE data to the same MQTT broker and topic. The message format should be a JSON array:
+
+```json
+[
+  {
+    "id": "AA:BB:CC:DD:EE:FF",
+    "name": "TempSensor",
+    "rssi": -65,
+    "advertising": {
+      "temp": 23.5,
+      "humidity": 45.2
+    }
+  }
+]
+```
+
 ### Network Configuration
 
 - **Local network**: Use the local IP address if the Android app is on the same WiFi network
 - **Internet access**: Use the public IP address, but you'll need to:
-  1. Configure port forwarding on your router (forward port 8080 to your local IP)
-  2. Ensure your firewall allows incoming connections on port 8080
+  1. Configure port forwarding on your router (forward port 8443 to your local IP)
+  2. Ensure your firewall allows incoming connections on port 8443
 
 ### Viewing the Dashboard
 
-Open your browser to `http://localhost:8080` to see:
+Open your browser to `https://localhost:8443` to see:
 - Number of active devices
 - Last update timestamp
 - Device list with RSSI (signal strength)
@@ -99,10 +203,24 @@ Open your browser to `http://localhost:8080` to see:
 
 The page auto-refreshes every 5 seconds.
 
-### API Endpoints
+### Communication Methods
+
+The server supports two methods for receiving BLE data:
+
+#### 1. MQTT (Recommended)
+
+The server subscribes to MQTT topics to receive data:
+- **Broker:** Configurable (default: `broker.hivemq.com`)
+- **Topic Pattern:** `mikrodesign/ble_scan/{gateway_id}`
+- **Server subscribes to:** `mikrodesign/ble_scan/+` (wildcard for all gateways)
+- **Message Format:** JSON array (same as HTTP POST body)
+
+Each Android device publishes to its own unique topic (e.g., `mikrodesign/ble_scan/phone1`)
+
+#### 2. HTTP REST API
 
 #### POST `/api/ble`
-Receive BLE device data from gateway app.
+Receive BLE device data from gateway app via HTTP.
 
 **Request body:**
 ```json
@@ -266,31 +384,129 @@ Nested fields are also supported:
 
 ## Android App Configuration
 
+### Option 1: MQTT (Recommended)
+
+#### Quick Setup with QR Code (Easiest!)
+
+1. Run the server: `python3 ble_gtw_server.py`
+2. A NEW QR code appears in the terminal
+3. Open your Android BLE scanner app
+4. Scan the QR code
+5. Done! The app is now connected
+
+**Important:** Each server restart generates a NEW connection ID for security. You'll need to scan the new QR code each time.
+
+The QR code contains everything:
+- Broker: `broker.hivemq.com`
+- Port: `8000` (WebSocket for mobile apps)
+- Topic: `mikrodesign/ble_scan/{unique_connection_id}`
+- Connection ID (freshly generated each restart)
+
+#### Manual Configuration
+
+If you can't scan the QR code, the server also displays manual configuration:
+
+**Broker:** `broker.hivemq.com`
+**Port:** `1883`
+**Topic:** (shown in server output, e.g., `mikrodesign/ble_scan/xK3pQz8A`)
+**QoS:** `1` (at least once)
+
+Benefits:
+- ✅ **Zero configuration** - auto-generated connection ID
+- ✅ **Maximum security** - fresh connection ID on every restart
+- ✅ **Auto-flush** - old connections become invalid automatically
+- ✅ **True 1:1 private** - unique random ID with timestamp
+- ✅ Works anywhere with internet (no port forwarding needed)
+- ✅ No SSL certificate issues
+- ✅ More reliable for mobile connections
+- ✅ Lower latency
+- ✅ QR code instant setup
+
+### Option 2: Direct HTTP (Fallback)
+
 Set the gateway endpoint URL in your Android BLE scanning app. The server displays both local and public IP addresses on startup.
 
 **For local network (same WiFi):**
 ```
-http://LOCAL_IP:8080/api/ble
+https://LOCAL_IP:8443/api/ble
 ```
 
 **For internet access (requires port forwarding):**
 ```
-http://PUBLIC_IP:8080/api/ble
+https://PUBLIC_IP:8443/api/ble
 ```
 
 The app should POST JSON arrays of device objects to this endpoint.
 
+**Note:** HTTP requires dealing with self-signed certificates (see below).
+
+### Handling Self-Signed Certificates in Android
+
+If your Android app doesn't trust the self-signed certificate, you have several options:
+
+**Option 1: Install certificate on device** (Recommended for testing)
+- Transfer `cert.pem` to your Android device
+- Install via Settings → Security → Install certificates
+
+**Option 2: Configure Network Security Config** (For development)
+Add to your Android app's `res/xml/network_security_config.xml`:
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+    <!-- For testing only - replace with your server IP -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">YOUR_SERVER_IP</domain>
+        <trust-anchors>
+            <certificates src="user" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>
+```
+
+And reference it in your `AndroidManifest.xml`:
+```xml
+<application
+    android:networkSecurityConfig="@xml/network_security_config"
+    ...>
+```
+
 ## Troubleshooting
 
 ### Server won't start
-- Check if port 8080 is already in use
+- Check if port 8443 is already in use: `lsof -i :8443`
 - Verify Python 3.7+ is installed
-- Ensure Flask is installed: `pip install flask`
+- Ensure required packages are installed: `pip install flask cryptography paho-mqtt`
+- If certificate generation fails, ensure `openssl` is installed
+
+### MQTT connection issues
+- **"paho-mqtt not installed"**: Install with `pip install paho-mqtt`
+- **"Failed to connect to MQTT broker"**: Check internet connection and broker address
+- **No data appearing**: Verify Android app is publishing to the correct topic pattern (`mikrodesign/ble_scan/{gateway_id}`)
+- **Multiple devices**: Each device should use a unique gateway_id (e.g., phone1, phone2, home, office)
+- **Using HiveMQ Cloud**: Ensure TLS is enabled and credentials are correct
+
+### Certificate errors
+- Delete `cert.pem` and `key.pem` to regenerate certificates
+- Ensure `cryptography` library is installed: `pip install cryptography`
+- If using openssl fallback, verify it's installed: `openssl version`
+
+### Android app can't connect (SSL errors)
+- **"Certificate not trusted"**: Install `cert.pem` on Android device or configure Network Security Config
+- **"Unable to resolve host"**: Check IP address is correct
+- **"Connection refused"**: Verify server is running and firewall allows port 8443
+- **Android 9+ cleartext traffic**: The server now uses HTTPS, no cleartext config needed
 
 ### No data appearing
-- Verify Android app is configured with correct IP address
-- Check firewall allows connections on port 8080
+- Verify Android app is configured with correct IP address and HTTPS
+- Check firewall allows connections on port 8443
 - View logs: `tail -f ble_gateway.log`
+- Test connection: `curl -k https://localhost:8443/` (the `-k` flag bypasses certificate verification)
 
 ### Database errors
 - Delete `ble_gateway.db` to recreate fresh database
