@@ -235,14 +235,27 @@ class MultiPacketBLEReceiver:
             return None
 
         try:
-            # Parse header (firmware sends: [0-1]=CompanyID, [2]=ProtocolID, [3]=DataType, etc.)
+            # Parse header
+            # Manufacturer data format:
+            # [0-1]: Company ID (0xFFE5)
+            # [2]: Protocol ID (0xAA)
+            # [3]: Data type (0xDD for raw captouch)
+            # [4-9]: MAC address (6 bytes)
+            # [10]: Stream ID low
+            # [11]: Stream ID high
+            # [12]: Total packets
+            # [13]: Sequence
+            # [14-15]: Payload length
+            # [16+]: Sample data
+
             company_id = struct.unpack('<H', data_bytes[0:2])[0]
             protocol_id = data_bytes[2]
             data_type = data_bytes[3]
-            stream_id = struct.unpack('<H', data_bytes[4:6])[0]
-            total_packets = data_bytes[6]
-            sequence = data_bytes[7]
-            payload_length = struct.unpack('<H', data_bytes[8:10])[0]
+            # Skip MAC at [4-9]
+            stream_id = struct.unpack('<H', data_bytes[10:12])[0]
+            total_packets = data_bytes[12]
+            sequence = data_bytes[13]
+            payload_length = struct.unpack('<H', data_bytes[14:16])[0]
 
             # Verify protocol
             if company_id != self.COMPANY_ID:
@@ -259,7 +272,7 @@ class MultiPacketBLEReceiver:
                 return None
 
             # Extract payload
-            payload = data_bytes[10:]
+            payload = data_bytes[16:]
 
             return {
                 'data_type': data_type,
