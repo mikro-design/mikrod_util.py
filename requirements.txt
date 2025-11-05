@@ -23,5 +23,14 @@ jsonschema==4.20.0
 # CORS support
 Flask-Cors==4.0.0
 
+# Rate limiting
+Flask-Limiter==3.5.0
+
 # Additional utilities
 requests==2.31.0
+
+# Testing dependencies (dev)
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-flask==1.3.0
+pytest-mock==3.12.0

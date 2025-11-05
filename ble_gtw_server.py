@@ -17,6 +17,25 @@ from functools import wraps
 
 app = Flask(__name__)
 
+# Configure rate limiting if flask-limiter is available
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+
+    # Initialize rate limiter
+    limiter = Limiter(
+        app=app,
+        key_func=get_remote_address,
+        default_limits=["200 per hour"],  # Global default
+        storage_uri="memory://",  # Use in-memory storage (for SQLite use: "sqlite:///rate_limit.db")
+        strategy="fixed-window"
+    )
+    logger_early = logging.getLogger('ble_gateway')
+    if logger_early.hasHandlers():
+        logger_early.info("✓ Rate limiting enabled")
+except ImportError:
+    limiter = None  # Rate limiting not available
+
 # Configure CORS if flask-cors is available
 try:
     from flask_cors import CORS
@@ -671,8 +690,18 @@ def setup_mqtt():
         return False
 
 
+def apply_rate_limit(limit_string):
+    """Conditionally apply rate limiting decorator"""
+    def decorator(f):
+        if limiter:
+            return limiter.limit(limit_string)(f)
+        return f
+    return decorator
+
+
 @app.route('/api/ble', methods=['POST'])
 @require_api_key
+@apply_rate_limit("30 per minute")
 def receive_ble_data():
     """Receive BLE device data from the gateway via HTTP"""
     try:
@@ -705,6 +734,7 @@ def receive_ble_data():
 
 @app.route('/api/devices', methods=['GET'])
 @require_api_key
+@apply_rate_limit("60 per minute")
 def get_devices():
     """Get the latest device data as JSON"""
     return jsonify(latest_data)
