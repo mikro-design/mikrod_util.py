@@ -11,6 +11,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import threading
+import os
+import secrets
+from functools import wraps
 
 app = Flask(__name__)
 
@@ -22,7 +25,7 @@ try:
         r"/api/*": {
             "origins": "*",  # In production, specify allowed origins
             "methods": ["GET", "POST"],
-            "allow_headers": ["Content-Type"]
+            "allow_headers": ["Content-Type", "Authorization", "X-API-Key"]
         },
         r"/health": {
             "origins": "*",
@@ -34,6 +37,68 @@ try:
         logger_early.info("✓ CORS enabled for API endpoints")
 except ImportError:
     pass  # CORS not available, will work without it
+
+# ============================================================================
+# AUTHENTICATION CONFIGURATION
+# ============================================================================
+
+# Load API key from environment or generate one
+API_KEY = os.environ.get('BLE_GATEWAY_API_KEY')
+
+if not API_KEY:
+    # Generate a secure random API key on first run
+    API_KEY = secrets.token_urlsafe(32)
+
+# Optional: Allow disabling auth for local testing
+AUTH_ENABLED = os.environ.get('BLE_GATEWAY_AUTH_ENABLED', 'true').lower() == 'true'
+
+
+def require_api_key(f):
+    """
+    Decorator to require API key authentication.
+    Checks for key in:
+    1. Authorization header: 'Bearer <api_key>'
+    2. X-API-Key header: '<api_key>'
+    3. Query parameter: ?api_key=<api_key>
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not AUTH_ENABLED:
+            return f(*args, **kwargs)
+
+        # Check Authorization header (Bearer token)
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header[7:]  # Remove 'Bearer ' prefix
+            if token == API_KEY:
+                return f(*args, **kwargs)
+
+        # Check X-API-Key header
+        api_key_header = request.headers.get('X-API-Key')
+        if api_key_header == API_KEY:
+            return f(*args, **kwargs)
+
+        # Check query parameter (less secure, but convenient for testing)
+        query_key = request.args.get('api_key')
+        if query_key == API_KEY:
+            return f(*args, **kwargs)
+
+        # No valid key found
+        client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        # Use logger after it's initialized (will be set up later)
+        try:
+            logger.warning(f"Unauthorized access attempt from {client_ip}")
+        except NameError:
+            pass  # Logger not yet initialized
+
+        return jsonify({
+            'error': 'Unauthorized',
+            'message': 'Valid API key required. Use Authorization: Bearer <key> or X-API-Key: <key> header.'
+        }), 401
+
+    return decorated_function
+
+# ============================================================================
 
 # Database file
 DB_FILE = 'ble_gateway.db'
@@ -607,6 +672,7 @@ def setup_mqtt():
 
 
 @app.route('/api/ble', methods=['POST'])
+@require_api_key
 def receive_ble_data():
     """Receive BLE device data from the gateway via HTTP"""
     try:
@@ -638,6 +704,7 @@ def receive_ble_data():
 
 
 @app.route('/api/devices', methods=['GET'])
+@require_api_key
 def get_devices():
     """Get the latest device data as JSON"""
     return jsonify(latest_data)
@@ -921,6 +988,34 @@ if __name__ == '__main__':
     print("\n🔒 Security:")
     print(f"   Using self-signed certificate for HTTPS")
     print(f"   ⚠️  You'll need to accept security warnings or install cert on Android")
+
+    # Show API key information
+    print(f"\n🔐 API Authentication:")
+    if AUTH_ENABLED:
+        print(f"   ✓ Authentication ENABLED")
+        # Show partial key for security (first 8 and last 8 chars)
+        if len(API_KEY) > 16:
+            masked_key = f"{API_KEY[:8]}...{API_KEY[-8:]}"
+        else:
+            masked_key = API_KEY[:4] + "..." + API_KEY[-4:]
+        print(f"   API Key: {masked_key}")
+        print(f"\n   📱 Configure your Android app:")
+        print(f"      Header: Authorization: Bearer {API_KEY}")
+        print(f"      Or: X-API-Key: {API_KEY}")
+        print(f"\n   💡 To set a custom key:")
+        print(f"      export BLE_GATEWAY_API_KEY='your-key-here'")
+        print(f"\n   🧪 To disable auth (testing only):")
+        print(f"      export BLE_GATEWAY_AUTH_ENABLED=false")
+
+        # Warn if API key was auto-generated
+        if not os.environ.get('BLE_GATEWAY_API_KEY'):
+            print(f"\n   ⚠️  WARNING: Using auto-generated key!")
+            print(f"      This key will change on restart.")
+            print(f"      Set BLE_GATEWAY_API_KEY env var to persist it.")
+    else:
+        print(f"   ⚠️  Authentication DISABLED (dev mode)")
+        print(f"   ⚠️  Anyone can access the API!")
+        print(f"   Enable with: export BLE_GATEWAY_AUTH_ENABLED=true")
     print("=" * 60)
 
     # Show supported sensor types
