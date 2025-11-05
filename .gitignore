@@ -50,3 +50,19 @@ Thumbs.db
 *.png
 *.jpg
 *.pdf
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+*.cover
+.hypothesis/
+
+# SSL certificates (generated at runtime)
+cert.pem
+key.pem
+
+# Connection ID (generated at runtime)
+connection_id.txt

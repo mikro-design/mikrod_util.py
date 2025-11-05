@@ -1,0 +1,36 @@
+# BLE Gateway Server Dependencies
+# Core dependencies
+Flask==3.0.0
+Werkzeug==3.0.1
+
+# SSL/TLS certificate generation
+cryptography==41.0.7
+
+# MQTT support
+paho-mqtt==1.6.1
+
+# QR code generation for mobile setup
+qrcode==7.4.2
+Pillow==10.1.0
+
+# Data visualization
+matplotlib==3.8.2
+numpy==1.26.2
+
+# Input validation
+jsonschema==4.20.0
+
+# CORS support
+Flask-Cors==4.0.0
+
+# Rate limiting
+Flask-Limiter==3.5.0
+
+# Additional utilities
+requests==2.31.0
+
+# Testing dependencies (dev)
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-flask==1.3.0
+pytest-mock==3.12.0

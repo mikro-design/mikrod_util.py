@@ -55,7 +55,7 @@ def process_ble_data_with_multipacket(data, source="HTTP"):
                         logger.info(f"   GND avg: {parsed.get('gnd_avg', 'N/A'):.1f}")
 
                     # Save complete stream to database
-                    # save_complete_stream_to_database(device_id, device_name, completed)
+                    save_complete_stream_to_database(device_id, device_name, completed)
 
             # Periodic cleanup (every ~100 packets)
             if ble_receiver.stats['packets_received'] % 100 == 0:
@@ -124,17 +124,44 @@ def save_complete_stream_to_database(device_id, device_name, stream_data):
 
 if __name__ == '__main__':
     # Test with simulated device data (same format as your Android app sends)
+    # Note: This example shows a single packet. In real usage, you would receive
+    # multiple packets with incrementing sequence numbers (00, 01, 02, etc.)
+    # until all 14 packets (0E total) are received.
+
+    print("=" * 70)
+    print("Multi-Packet BLE Gateway Integration Example")
+    print("=" * 70)
+    print("\nThis example demonstrates how to integrate multipacket_ble with")
+    print("ble_gtw_server.py to handle large data transmissions split across")
+    print("multiple BLE advertising packets.\n")
+    print("To use in production:")
+    print("1. Copy process_ble_data_with_multipacket() to ble_gtw_server.py")
+    print("2. Replace the existing process_ble_data() or integrate both")
+    print("3. Uncomment the multipacket_streams table creation")
+    print("4. Test with real devices that send manufacturer data")
+    print("=" * 70)
+    print()
+
     test_data = [
         {
             'id': 'AA:BB:CC:DD:EE:FF',
             'name': 'Hexagon Sensor 1',
             'rssi': -65,
             'advertising': {
-                'manufacturerData': 'FFE5AA DD 0100 0E 00 00A8 05910590059305910594 0590'
-                # Format: CompanyID Protocol DataType StreamID TotalPkts Seq PayloadLen [12 bytes payload]
+                # Example manufacturer data packet (packet 0 of 14)
+                # Format: FFE5 (CompanyID) AA (Protocol) DD (DataType) 0100 (StreamID)
+                #         0E (TotalPackets) 00 (Sequence) 00A8 (PayloadLen=168)
+                #         [12 bytes of payload data]
+                'manufacturerData': 'FFE5AADD01000E0000A805910590059305910594059005920591'
             }
         }
     ]
 
     # Process it
+    print("Processing example packet...")
     process_ble_data_with_multipacket(test_data)
+
+    print("\n" + "=" * 70)
+    print("Example complete! Check logs above for details.")
+    print("In production, continue sending packets with sequence 01, 02, etc.")
+    print("=" * 70)
