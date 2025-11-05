@@ -14,9 +14,94 @@ import threading
 
 app = Flask(__name__)
 
+# Configure CORS if flask-cors is available
+try:
+    from flask_cors import CORS
+    # Allow CORS for API endpoints only
+    CORS(app, resources={
+        r"/api/*": {
+            "origins": "*",  # In production, specify allowed origins
+            "methods": ["GET", "POST"],
+            "allow_headers": ["Content-Type"]
+        },
+        r"/health": {
+            "origins": "*",
+            "methods": ["GET"]
+        }
+    })
+    logger_early = logging.getLogger('ble_gateway')
+    if logger_early.hasHandlers():
+        logger_early.info("✓ CORS enabled for API endpoints")
+except ImportError:
+    pass  # CORS not available, will work without it
+
 # Database file
 DB_FILE = 'ble_gateway.db'
 CONNECTION_ID_FILE = 'connection_id.txt'  # Stores the unique connection ID
+
+# JSON Schema for input validation
+BLE_DEVICE_SCHEMA = {
+    "type": "array",
+    "minItems": 1,
+    "maxItems": 100,  # Prevent large payloads
+    "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "pattern": "^[A-Fa-f0-9:]{17}$|^[A-Fa-f0-9]{12}$",  # MAC address format
+                "maxLength": 50
+            },
+            "name": {
+                "type": "string",
+                "maxLength": 100
+            },
+            "rssi": {
+                "type": "integer",
+                "minimum": -120,
+                "maximum": 0
+            },
+            "advertising": {
+                "type": "object"
+            }
+        }
+    }
+}
+
+
+def validate_ble_data(data):
+    """
+    Validate BLE device data against schema.
+    Returns (is_valid, error_message)
+    """
+    try:
+        import jsonschema
+        jsonschema.validate(instance=data, schema=BLE_DEVICE_SCHEMA)
+        return True, None
+    except jsonschema.exceptions.ValidationError as e:
+        return False, f"Validation error: {e.message}"
+    except jsonschema.exceptions.SchemaError as e:
+        logger.error(f"Schema error: {e}")
+        return False, "Internal validation error"
+    except ImportError:
+        # jsonschema not installed, do basic validation
+        if not isinstance(data, list):
+            return False, "Data must be an array"
+        if len(data) == 0:
+            return False, "Data array cannot be empty"
+        if len(data) > 100:
+            return False, "Too many devices (max 100)"
+        for device in data:
+            if not isinstance(device, dict):
+                return False, "Each device must be an object"
+            if 'id' not in device:
+                return False, "Each device must have an 'id' field"
+            if not isinstance(device.get('id'), str):
+                return False, "Device 'id' must be a string"
+            if len(device.get('id', '')) > 50:
+                return False, "Device 'id' too long"
+        return True, None
 
 # MQTT Configuration (HiveMQ Cloud or any MQTT broker)
 MQTT_BROKER = "broker.hivemq.com"  # Free HiveMQ public broker
@@ -268,12 +353,65 @@ def init_database():
     conn.close()
 
 
-# Sensor detection removed - plotting tool handles this
-# Server just stores raw data
+# Sensor detection patterns (field name -> sensor type, unit)
+SENSOR_PATTERNS = {
+    # Temperature sensors
+    'temp': ('temperature', '°C'),
+    'temperature': ('temperature', '°C'),
+    # Humidity
+    'hum': ('humidity', '%'),
+    'humidity': ('humidity', '%'),
+    # Pressure
+    'pressure': ('pressure', 'hPa'),
+    'press': ('pressure', 'hPa'),
+    # Battery
+    'bat': ('battery', '%'),
+    'battery': ('battery', '%'),
+    'batt': ('battery', '%'),
+    # Voltage
+    'volt': ('voltage', 'V'),
+    'voltage': ('voltage', 'V'),
+    'vdd': ('voltage', 'V'),
+    # Current
+    'current': ('current', 'A'),
+    'curr': ('current', 'A'),
+    # Light
+    'light': ('light', 'lux'),
+    'lux': ('light', 'lux'),
+    'illuminance': ('light', 'lux'),
+    # Air quality
+    'co2': ('co2', 'ppm'),
+    'voc': ('voc', 'ppb'),
+    'pm25': ('pm25', 'µg/m³'),
+    'pm10': ('pm10', 'µg/m³'),
+}
 
 
-def save_to_database(device_id, device_name, rssi, advertising_data):
-    """Save device reading to database (raw data only)"""
+def detect_sensors(advertising_data, path=''):
+    """
+    Recursively detect sensor values in advertising data.
+    Returns list of (sensor_type, value, unit) tuples.
+    """
+    sensors = []
+
+    if isinstance(advertising_data, dict):
+        for key, value in advertising_data.items():
+            # Check if this field matches a sensor pattern
+            key_lower = key.lower()
+            if key_lower in SENSOR_PATTERNS and isinstance(value, (int, float)):
+                sensor_type, unit = SENSOR_PATTERNS[key_lower]
+                sensors.append((sensor_type, value, unit))
+                logger.debug(f"  Detected sensor: {sensor_type}={value} {unit} (from field: {key})")
+            # Recurse into nested dicts
+            elif isinstance(value, dict):
+                nested_path = f"{path}.{key}" if path else key
+                sensors.extend(detect_sensors(value, nested_path))
+
+    return sensors
+
+
+def save_to_database(device_id, device_name, rssi, advertising_data, sensors=None):
+    """Save device reading and detected sensors to database"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
@@ -283,6 +421,17 @@ def save_to_database(device_id, device_name, rssi, advertising_data):
             INSERT INTO device_readings (device_id, device_name, rssi, raw_data)
             VALUES (?, ?, ?, ?)
         ''', (device_id, device_name, rssi, json.dumps(advertising_data)))
+
+        reading_id = cursor.lastrowid
+
+        # Insert sensor data if provided
+        if sensors:
+            for sensor_type, sensor_value, unit in sensors:
+                cursor.execute('''
+                    INSERT INTO sensor_data (reading_id, sensor_type, sensor_value, unit)
+                    VALUES (?, ?, ?, ?)
+                ''', (reading_id, sensor_type, sensor_value, unit))
+            logger.debug(f"Saved {len(sensors)} sensor readings for {device_name}")
 
         conn.commit()
 
@@ -325,6 +474,8 @@ def process_ble_data(data, source="HTTP"):
         logger.info(f"📡 INCOMING DATA ({source}) - {len(data)} device(s)")
         logger.info("=" * 60)
 
+        total_sensors = 0
+
         for idx, device in enumerate(data, 1):
             device_id = device.get('id', 'unknown')
             device_name = device.get('name', 'Unknown')
@@ -336,22 +487,32 @@ def process_ble_data(data, source="HTTP"):
             logger.info(f"  ID: {device_id}")
             logger.info(f"  RSSI: {rssi} dBm {'📶' if rssi > -70 else '📡' if rssi > -85 else '📉'}")
 
-            # Log raw advertising data if present
+            # Detect sensors in advertising data
+            sensors = detect_sensors(advertising) if advertising else []
+
+            if sensors:
+                logger.info(f"  Sensors detected: {len(sensors)}")
+                for sensor_type, sensor_value, unit in sensors:
+                    logger.info(f"    • {sensor_type}: {sensor_value} {unit}")
+                total_sensors += len(sensors)
+
+            # Log raw advertising data if present (debug level)
             if advertising:
                 logger.debug(f"  Raw advertising data: {json.dumps(advertising, indent=2)}")
 
-            # Save to database (raw data only)
-            save_to_database(device_id, device_name, rssi, advertising)
+            # Save to database with sensor data
+            save_to_database(device_id, device_name, rssi, advertising, sensors)
 
             logger.info("")  # Blank line between devices
 
         # Summary
-        logger.info(f"✓ Successfully processed {len(data)} device(s)")
+        logger.info(f"✓ Successfully processed {len(data)} device(s), {total_sensors} total sensor reading(s)")
         logger.info("=" * 60)
 
         return {
             'status': 'success',
             'received': len(data),
+            'sensors_detected': total_sensors,
             'timestamp': latest_data['timestamp']
         }, 200
 
@@ -364,8 +525,9 @@ def on_mqtt_connect(client, userdata, flags, rc):
     """Callback when MQTT client connects to broker"""
     if rc == 0:
         logger.info(f"✓ Connected to MQTT broker: {MQTT_BROKER}")
-        client.subscribe(MQTT_TOPIC)
-        logger.info(f"✓ Subscribed to topic: {MQTT_TOPIC}")
+        # Subscribe with QoS 1 (at least once delivery)
+        client.subscribe(MQTT_TOPIC, qos=1)
+        logger.info(f"✓ Subscribed to topic: {MQTT_TOPIC} (QoS 1)")
         logger.info(f"  (1:1 private connection)")
     else:
         logger.error(f"❌ Failed to connect to MQTT broker, return code: {rc}")
@@ -391,7 +553,9 @@ def on_mqtt_message(client, userdata, msg):
 def on_mqtt_disconnect(client, userdata, rc):
     """Callback when MQTT client disconnects"""
     if rc != 0:
-        logger.warning(f"⚠️  Unexpected MQTT disconnection. Attempting to reconnect...")
+        logger.warning(f"⚠️  Unexpected MQTT disconnection (code: {rc})")
+        logger.info("   MQTT client will automatically reconnect...")
+        # paho-mqtt's loop_forever() automatically reconnects
 
 
 def setup_mqtt():
@@ -446,18 +610,75 @@ def setup_mqtt():
 def receive_ble_data():
     """Receive BLE device data from the gateway via HTTP"""
     try:
-        data = request.get_json()
+        # Check content type
+        if not request.is_json:
+            return jsonify({'error': 'Content-Type must be application/json'}), 400
+
+        # Parse JSON
+        try:
+            data = request.get_json()
+        except Exception as e:
+            logger.warning(f"Invalid JSON received: {e}")
+            return jsonify({'error': 'Invalid JSON'}), 400
+
+        # Validate input
+        is_valid, error_msg = validate_ble_data(data)
+        if not is_valid:
+            logger.warning(f"Validation failed: {error_msg}")
+            return jsonify({'error': error_msg}), 400
+
+        # Process data
         result, status_code = process_ble_data(data, source="HTTP")
         return jsonify(result), status_code
+
     except Exception as e:
+        # Log full error but return generic message to client
         logger.error(f"❌ Error in HTTP endpoint: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Internal server error'}), 500
 
 
 @app.route('/api/devices', methods=['GET'])
 def get_devices():
     """Get the latest device data as JSON"""
     return jsonify(latest_data)
+
+
+@app.route('/health', methods=['GET'])
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for monitoring"""
+    try:
+        # Check database connectivity
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM device_readings')
+        reading_count = cursor.fetchone()[0]
+        conn.close()
+        db_status = 'healthy'
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+        db_status = 'unhealthy'
+        reading_count = 0
+
+    # Check MQTT status
+    mqtt_status = 'connected' if mqtt_client and mqtt_client.is_connected() else 'disconnected'
+
+    health = {
+        'status': 'healthy' if db_status == 'healthy' else 'degraded',
+        'timestamp': datetime.now().isoformat(),
+        'components': {
+            'database': {
+                'status': db_status,
+                'readings_count': reading_count
+            },
+            'mqtt': {
+                'status': mqtt_status
+            }
+        }
+    }
+
+    status_code = 200 if health['status'] == 'healthy' else 503
+    return jsonify(health), status_code
 
 
 def generate_ssl_certificate():
@@ -493,6 +714,9 @@ def generate_ssl_certificate():
             x509.NameAttribute(NameOID.COMMON_NAME, u"BLE-Gateway"),
         ])
 
+        # Use timezone-aware datetime (fixes deprecated utcnow)
+        now = datetime.datetime.now(datetime.timezone.utc)
+
         cert = x509.CertificateBuilder().subject_name(
             subject
         ).issuer_name(
@@ -502,9 +726,9 @@ def generate_ssl_certificate():
         ).serial_number(
             x509.random_serial_number()
         ).not_valid_before(
-            datetime.datetime.utcnow()
+            now
         ).not_valid_after(
-            datetime.datetime.utcnow() + datetime.timedelta(days=365)
+            now + datetime.timedelta(days=365)
         ).sign(private_key, hashes.SHA256())
 
         # Write private key
@@ -519,8 +743,14 @@ def generate_ssl_certificate():
         with open(cert_file, 'wb') as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
 
+        # Set secure file permissions
+        import os
+        os.chmod(key_file, 0o600)  # Private key: owner read/write only
+        os.chmod(cert_file, 0o644)  # Certificate: owner rw, others read
+
         logger.info(f"✓ SSL certificate generated: {cert_file.absolute()}")
         logger.info(f"✓ SSL key generated: {key_file.absolute()}")
+        logger.info(f"✓ Secure file permissions set")
 
     except ImportError:
         # Fallback to openssl command
@@ -537,8 +767,14 @@ def generate_ssl_certificate():
         if result.returncode != 0:
             raise Exception(f"Failed to generate certificate: {result.stderr}")
 
+        # Set secure file permissions
+        import os
+        os.chmod(key_file, 0o600)  # Private key: owner read/write only
+        os.chmod(cert_file, 0o644)  # Certificate: owner rw, others read
+
         logger.info(f"✓ SSL certificate generated: {cert_file.absolute()}")
         logger.info(f"✓ SSL key generated: {key_file.absolute()}")
+        logger.info(f"✓ Secure file permissions set")
 
     return str(cert_file), str(key_file)
 
@@ -685,6 +921,18 @@ if __name__ == '__main__':
     print("\n🔒 Security:")
     print(f"   Using self-signed certificate for HTTPS")
     print(f"   ⚠️  You'll need to accept security warnings or install cert on Android")
+    print("=" * 60)
+
+    # Show supported sensor types
+    sensor_types = sorted(set(sensor_type for sensor_type, _ in SENSOR_PATTERNS.values()))
+    print(f"\n📡 Supported sensor types:")
+    sensor_lines = []
+    for i in range(0, len(sensor_types), 4):
+        line = ', '.join(sensor_types[i:i+4])
+        sensor_lines.append(f"   {line}")
+    for line in sensor_lines:
+        print(line)
+
     print("=" * 60)
     print(f"📝 Logging to: ble_gateway.log")
     print("💾 Database:   ble_gateway.db")
