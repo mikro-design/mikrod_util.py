@@ -7,7 +7,7 @@ Werkzeug==3.0.1
 cryptography==41.0.7
 
 # MQTT support
-paho-mqtt==1.6.1
+paho-mqtt>=2.0.0
 
 # QR code generation for mobile setup
 qrcode==7.4.2
