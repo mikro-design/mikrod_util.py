@@ -409,36 +409,147 @@ class StreamBuffer:
 # Example parsers for different data types
 
 def parse_captouch_data(data: bytes) -> Dict:
-    """
-    Parser for capacitive touch raw samples (data_type=0xDD)
+     """
+     Parser for capacitive touch raw samples (data_type=0xDD)
 
-    Expected format: 84 int16_t samples (168 bytes)
-    """
-    if len(data) < 168:
-        raise ValueError(f"Incomplete captouch data: {len(data)}/168 bytes")
+     Expected format: 84 int16_t samples (168 bytes)
+     Transmitted as: 14 packets × 12 bytes (6 samples) per packet
+     """
+     if len(data) < 168:
+         raise ValueError(f"Incomplete captouch data: {len(data)}/168 bytes")
 
-    # Parse samples (big-endian signed int16)
-    samples = []
-    for i in range(84):
-        offset = i * 2
-        sample = struct.unpack('>h', data[offset:offset+2])[0]
-        samples.append(sample)
+     # Parse samples (big-endian signed int16)
+     samples = []
+     for i in range(84):
+         offset = i * 2
+         sample = struct.unpack('>h', data[offset:offset+2])[0]
+         samples.append(sample)
 
-    # Structure the data
-    result = {
-        'total_samples': len(samples),
-        'vdd_ref': samples[0:8],
-        'gnd_ref': samples[8:16],
-        'self_cap_raw': samples[16:50],
-        'mutual_cap_raw': samples[50:84],
-    }
+     # Structure the data
+     result = {
+         'total_samples': len(samples),
+         'vdd_ref': samples[0:8],
+         'gnd_ref': samples[8:16],
+         'self_cap_raw': samples[16:50],
+         'mutual_cap_raw': samples[50:84],
+     }
 
-    # Calculate averages
-    result['vdd_avg'] = sum(result['vdd_ref']) / len(result['vdd_ref'])
-    result['gnd_avg'] = sum(result['gnd_ref']) / len(result['gnd_ref'])
-    result['adc_range'] = result['vdd_avg'] - result['gnd_avg']
+     # Calculate averages
+     result['vdd_avg'] = sum(result['vdd_ref']) / len(result['vdd_ref'])
+     result['gnd_avg'] = sum(result['gnd_ref']) / len(result['gnd_ref'])
+     result['adc_range'] = result['vdd_avg'] - result['gnd_avg']
 
-    return result
+     return result
+
+
+class BLEDataFetcher:
+     """
+     High-level interface for fetching BLE data with automatic deduplication.
+     
+     Handles the complete workflow:
+     - Deduplication of 4× retransmissions per packet
+     - Multi-packet stream reassembly (14 packets → 84 samples)
+     - Stream ID tracking to detect measurement cycles
+     - Automatic data validation
+     
+     Usage:
+         fetcher = BLEDataFetcher()
+         
+         # Process incoming BLE advertisement packets
+         result = fetcher.receive_packet(
+             device_id='AA:BB:CC:DD:EE:FF',
+             manufacturer_data=raw_bytes
+         )
+         
+         if result:
+             print(f"Complete stream: {result['samples']}")
+     """
+     
+     def __init__(self):
+         """Initialize fetcher with deduplication and reassembly"""
+         self.receiver = MultiPacketBLEReceiver(
+             stream_timeout_seconds=30,  # Complete within 30s window
+             dedup_timeout_seconds=120,  # Remember duplicates for 2 minutes
+             auto_cleanup=True,
+             cleanup_interval_seconds=5
+         )
+         # Register the captouch parser
+         self.receiver.register_parser(0xDD, parse_captouch_data)
+         
+         # Track stream IDs per device to detect new measurement cycles
+         self.device_stream_history = {}  # {device_id: last_stream_id}
+         self.stream_callbacks = []  # List of callbacks for completed streams
+     
+     def on_stream_complete(self, callback: Callable):
+         """Register callback for when a stream completes"""
+         self.stream_callbacks.append(callback)
+     
+     def receive_packet(self, device_id: str, manufacturer_data, timestamp=None) -> Optional[Dict]:
+         """
+         Process an incoming BLE advertisement packet.
+         
+         Automatically deduplicates and reassembles data across multiple packets.
+         
+         Args:
+             device_id: Device MAC address
+             manufacturer_data: Raw BLE manufacturer data (bytes or hex string)
+             timestamp: Optional packet timestamp
+         
+         Returns:
+             dict with complete measurement if stream is complete, None otherwise
+         """
+         result = self.receiver.process_packet(device_id, manufacturer_data, timestamp)
+         
+         if result:
+             # Stream is complete, invoke callbacks
+             for callback in self.stream_callbacks:
+                 try:
+                     callback(device_id, result)
+                 except Exception as e:
+                     logger.error(f"Callback error: {e}", exc_info=True)
+         
+         return result
+     
+     def get_stats(self) -> Dict:
+         """Get statistics on packet processing and deduplication"""
+         stats = self.receiver.get_stats()
+         stats['tracked_devices'] = len(self.device_stream_history)
+         return stats
+
+
+# ============================================================================
+# BLE Data Fetching Helpers
+# ============================================================================
+
+def create_ble_fetcher() -> BLEDataFetcher:
+     """Factory function to create a preconfigured BLE data fetcher"""
+     return BLEDataFetcher()
+
+
+def extract_samples_from_stream(stream_data: Dict) -> Optional[List[int]]:
+     """
+     Extract 84 ADC samples from a complete captouch stream.
+     
+     Args:
+         stream_data: Complete stream dict from BLEDataFetcher
+     
+     Returns:
+         List of 84 samples, or None if parsing failed
+     """
+     try:
+         if 'parsed' in stream_data and 'self_cap_raw' in stream_data['parsed']:
+             parsed = stream_data['parsed']
+             # Combine all samples in order: VDD, GND, self-cap, mutual-cap
+             all_samples = (
+                 parsed.get('vdd_ref', []) +
+                 parsed.get('gnd_ref', []) +
+                 parsed.get('self_cap_raw', []) +
+                 parsed.get('mutual_cap_raw', [])
+             )
+             return all_samples
+     except Exception as e:
+         logger.error(f"Error extracting samples: {e}")
+     return None
 
 
 if __name__ == '__main__':
