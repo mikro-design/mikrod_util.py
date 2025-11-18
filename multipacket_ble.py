@@ -6,6 +6,8 @@ with automatic deduplication of repeated frames
 """
 import struct
 import logging
+import threading
+import time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Tuple, List, Callable
 
@@ -35,11 +37,15 @@ class MultiPacketBLEReceiver:
 
     def __init__(self,
                  stream_timeout_seconds=60,
-                 dedup_timeout_seconds=120):
+                 dedup_timeout_seconds=120,
+                 auto_cleanup=True,
+                 cleanup_interval_seconds=10):
         """
         Args:
             stream_timeout_seconds: How long to wait for incomplete streams
             dedup_timeout_seconds: How long to remember seen packets
+            auto_cleanup: Enable automatic cleanup thread (default: True)
+            cleanup_interval_seconds: How often to run cleanup (default: 10)
         """
         self.stream_timeout = timedelta(seconds=stream_timeout_seconds)
         self.dedup_timeout = timedelta(seconds=dedup_timeout_seconds)
@@ -65,6 +71,12 @@ class MultiPacketBLEReceiver:
             'parse_errors': 0
         }
 
+        # Automatic cleanup thread
+        self._cleanup_thread = None
+        self._cleanup_stop_event = threading.Event()
+        if auto_cleanup:
+            self._start_cleanup_thread(cleanup_interval_seconds)
+
     def register_parser(self, data_type: int, parser_func: Callable):
         """
         Register a parser function for a specific data type.
@@ -75,6 +87,35 @@ class MultiPacketBLEReceiver:
         """
         self.parsers[data_type] = parser_func
         logger.info(f"Registered parser for data type 0x{data_type:02X}")
+
+    def _start_cleanup_thread(self, interval_seconds):
+        """Start automatic cleanup background thread"""
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            args=(interval_seconds,),
+            daemon=True,
+            name="MultiPacketBLE-Cleanup"
+        )
+        self._cleanup_thread.start()
+        logger.debug(f"Started automatic cleanup thread (interval: {interval_seconds}s)")
+
+    def _cleanup_loop(self, interval_seconds):
+        """Background cleanup loop"""
+        while not self._cleanup_stop_event.is_set():
+            self.cleanup()
+            self._cleanup_stop_event.wait(interval_seconds)
+
+    def stop(self):
+        """Stop automatic cleanup thread"""
+        if self._cleanup_thread and self._cleanup_thread.is_alive():
+            logger.debug("Stopping cleanup thread...")
+            self._cleanup_stop_event.set()
+            self._cleanup_thread.join(timeout=5)
+            logger.debug("Cleanup thread stopped")
+
+    def __del__(self):
+        """Cleanup when object is destroyed"""
+        self.stop()
 
     def process_packet(self, device_id: str, manufacturer_data, timestamp=None) -> Optional[Dict]:
         """
