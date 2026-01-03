@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 @pytest.fixture
 def receiver():
     """Create a fresh receiver for each test"""
-    return MultiPacketBLEReceiver()
+    receiver = MultiPacketBLEReceiver()
+    receiver.register_parser(0xDD, parse_captouch_data)
+    return receiver
 
 
 @pytest.fixture
@@ -281,7 +283,13 @@ class TestSampleParsing:
         # Create 168 bytes of test data (84 samples)
         data = b''
         for i in range(84):
-            data += struct.pack('>h', 1000 + i)  # Unique value per sample
+            if i < 8:
+                value = 2000 + i  # vdd_ref higher
+            elif i < 16:
+                value = 1000 + i  # gnd_ref lower
+            else:
+                value = 1500 + i  # remaining samples
+            data += struct.pack('>h', value)
         
         assert len(data) == 168
         
@@ -311,7 +319,7 @@ class TestBLEDataFetcher:
     
     def test_fetcher_initialization(self, fetcher):
         """Verify fetcher initializes correctly"""
-        assert fetcher.fetcher is not None
+        assert fetcher.receiver is not None
         assert len(fetcher.stream_callbacks) == 0
     
     def test_fetcher_callback_registration(self, fetcher):
@@ -392,8 +400,9 @@ class TestIntegration:
                     break  # No need to process remaining retransmissions
         
         # Verify deduplication worked
-        assert receiver.stats['packets_received'] == 14 * 4  # 56 total
-        assert receiver.stats['packets_duplicate'] == 42  # 56 - 14
+        # We stop after the first receipt of the last packet.
+        assert receiver.stats['packets_received'] == (13 * 4) + 1
+        assert receiver.stats['packets_duplicate'] == 13 * 3
         assert receiver.stats['streams_completed'] == 1
     
     def test_multiple_concurrent_streams(self, receiver):

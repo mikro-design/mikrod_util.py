@@ -4,6 +4,10 @@ BLE Gateway Server - Receives BLE device data from the Android app via MQTT or H
 """
 from flask import Flask, request, jsonify, render_template_string
 from datetime import datetime
+import base64
+import binascii
+import struct
+import copy
 import json
 import sqlite3
 import re
@@ -12,6 +16,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import threading
 import os
+import time
+import queue
 import secrets
 from functools import wraps
 
@@ -70,6 +76,16 @@ if not API_KEY:
 
 # Optional: Allow disabling auth for local testing
 AUTH_ENABLED = os.environ.get('BLE_GATEWAY_AUTH_ENABLED', 'true').lower() == 'true'
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ('1', 'true', 'yes', 'y')
+
+# Require API key in MQTT payloads when auth is enabled (can be overridden)
+MQTT_REQUIRE_API_KEY = _env_flag('BLE_GATEWAY_MQTT_REQUIRE_API_KEY', default=AUTH_ENABLED)
+LOG_COMPACT = _env_flag('BLE_GATEWAY_LOG_COMPACT', default=False)
 
 
 def require_api_key(f):
@@ -138,7 +154,7 @@ BLE_DEVICE_SCHEMA = {
                 "maxLength": 50
             },
             "name": {
-                "type": "string",
+                "type": ["string", "null"],
                 "maxLength": 100
             },
             "rssi": {
@@ -147,7 +163,7 @@ BLE_DEVICE_SCHEMA = {
                 "maximum": 0
             },
             "advertising": {
-                "type": "object"
+                "type": ["object", "null"]
             }
         }
     }
@@ -202,6 +218,20 @@ MQTT_TOPIC = None
 MQTT_CLIENT_ID = None
 
 mqtt_client = None
+MQTT_QUEUE_MAXSIZE = 1000
+MQTT_WORKER_LOG_INTERVAL = 10  # seconds
+MQTT_WORKER_ENABLED = True
+mqtt_queue = queue.Queue(maxsize=MQTT_QUEUE_MAXSIZE)
+mqtt_worker_thread = None
+MQTT_STATS = {
+    'messages': 0,
+    'devices': 0,
+    'last_log': time.time(),
+}
+
+# Thread coordination
+DB_WRITE_LOCK = threading.Lock()
+LATEST_DATA_LOCK = threading.Lock()
 
 # Store received data in memory
 latest_data = {
@@ -357,6 +387,11 @@ def setup_logging():
     # Create logger
     logger = logging.getLogger('ble_gateway')
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    # Avoid adding duplicate handlers on reload/import
+    if logger.handlers:
+        return logger
 
     # Create formatters
     detailed_formatter = logging.Formatter(
@@ -393,48 +428,306 @@ def setup_logging():
 logger = setup_logging()
 
 
+def get_db_connection():
+    """Create a configured SQLite connection"""
+    conn = sqlite3.connect(DB_FILE, timeout=5)
+    try:
+        conn.execute('PRAGMA journal_mode=WAL')
+    except sqlite3.OperationalError:
+        pass
+    conn.execute('PRAGMA synchronous=NORMAL')
+    conn.execute('PRAGMA busy_timeout=5000')
+    return conn
+
+
+def _json_default(value):
+    if isinstance(value, (bytes, bytearray)):
+        return value.hex()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def normalize_advertising_data(advertising_data):
+    """Return (safe_obj, json_string) for advertising payloads"""
+    if not advertising_data:
+        return {}, "{}"
+    try:
+        advertising_json = json.dumps(advertising_data, default=_json_default)
+        return json.loads(advertising_json), advertising_json
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Failed to serialize advertising data: {e}")
+        return {}, "{}"
+
+
+def _coerce_advertising_json(advertising_data):
+    if advertising_data is None:
+        return "{}"
+    if isinstance(advertising_data, str):
+        return advertising_data
+    return json.dumps(advertising_data, default=_json_default)
+
+
+def _extract_path_value(data, field_path):
+    """Extract a nested value using dot notation (e.g., 'manufacturerData.bytes.0')"""
+    if not field_path:
+        return None
+
+    parts = field_path.split('.')
+    current = data
+
+    for part in parts:
+        if isinstance(current, dict):
+            current = current.get(part)
+        elif isinstance(current, list):
+            try:
+                index = int(part)
+            except ValueError:
+                return None
+            if index < 0 or index >= len(current):
+                return None
+            current = current[index]
+        else:
+            return None
+
+        if current is None:
+            return None
+
+    return current
+
+
+def _coerce_bytes(value):
+    """Normalize common BLE payload encodings into bytes."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, list):
+        if all(isinstance(item, int) for item in value):
+            return bytes(item & 0xFF for item in value)
+        return None
+    if isinstance(value, dict):
+        for key in ('bytes', 'data', 'raw', 'value'):
+            if key in value:
+                return _coerce_bytes(value[key])
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        hex_text = text[2:] if text.lower().startswith('0x') else text
+        if re.fullmatch(r'[0-9a-fA-F]+', hex_text) and len(hex_text) % 2 == 0:
+            try:
+                return bytes.fromhex(hex_text)
+            except ValueError:
+                pass
+        try:
+            return base64.b64decode(text, validate=True)
+        except (binascii.Error, ValueError):
+            try:
+                return base64.b64decode(text)
+            except (binascii.Error, ValueError):
+                return None
+    return None
+
+
+def _decode_with_format(data_bytes, fmt, byte_offset=0):
+    fmt_map = {
+        'u8': ('B', 1),
+        'i8': ('b', 1),
+        'u16le': ('<H', 2),
+        'u16be': ('>H', 2),
+        'i16le': ('<h', 2),
+        'i16be': ('>h', 2),
+        'u32le': ('<I', 4),
+        'u32be': ('>I', 4),
+        'i32le': ('<i', 4),
+        'i32be': ('>i', 4),
+        'f32le': ('<f', 4),
+        'f32be': ('>f', 4),
+    }
+    fmt_key = fmt.lower()
+    if fmt_key not in fmt_map:
+        logger.warning(f"Unknown selector format '{fmt}'")
+        return None
+
+    struct_fmt, size = fmt_map[fmt_key]
+    if byte_offset < 0 or byte_offset + size > len(data_bytes):
+        return None
+    segment = data_bytes[byte_offset:byte_offset + size]
+    return struct.unpack(struct_fmt, segment)[0]
+
+
+def _decode_bytes(data_bytes, byte_offset=0, byte_length=None, endian='little', signed=False):
+    if byte_length is None:
+        return None
+    if byte_offset < 0 or byte_length <= 0:
+        return None
+    end = byte_offset + byte_length
+    if end > len(data_bytes):
+        return None
+    segment = data_bytes[byte_offset:end]
+    byteorder = 'little' if str(endian).lower() != 'big' else 'big'
+    return int.from_bytes(segment, byteorder=byteorder, signed=bool(signed))
+
+
+def _coerce_number(value, default=None):
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_selector_value(advertising_data, selector):
+    raw_value = _extract_path_value(advertising_data, selector.get('path'))
+    if raw_value is None:
+        return None
+
+    value = None
+    if isinstance(raw_value, (int, float)):
+        value = raw_value
+    else:
+        raw_bytes = _coerce_bytes(raw_value)
+        if raw_bytes is None:
+            return None
+        byte_offset = selector.get('byte_offset', selector.get('offset', 0))
+        fmt = selector.get('format')
+        if fmt:
+            value = _decode_with_format(raw_bytes, fmt, byte_offset=byte_offset)
+        else:
+            byte_length = selector.get('byte_length', selector.get('length'))
+            endian = selector.get('endian', 'little')
+            signed = selector.get('signed', False)
+            value = _decode_bytes(
+                raw_bytes,
+                byte_offset=byte_offset,
+                byte_length=byte_length,
+                endian=endian,
+                signed=signed
+            )
+
+    if value is None:
+        return None
+
+    scale = _coerce_number(selector.get('scale', 1), default=1)
+    value_offset = _coerce_number(selector.get('value_offset', selector.get('add', 0)), default=0)
+    try:
+        return (value * scale) + value_offset
+    except TypeError:
+        return None
+
+
+def _normalize_selectors(selectors):
+    normalized = []
+    for idx, selector in enumerate(selectors):
+        if not isinstance(selector, dict):
+            logger.warning(f"Ignoring selector {idx}: not an object")
+            continue
+        sensor_type = selector.get('sensor_type') or selector.get('sensor')
+        unit = selector.get('unit')
+        path = selector.get('path') or selector.get('field')
+        if not sensor_type or not unit or not path:
+            logger.warning(f"Ignoring selector {idx}: missing sensor_type, unit, or path")
+            continue
+        normalized.append({
+            'sensor_type': sensor_type,
+            'unit': unit,
+            'path': path,
+            'format': selector.get('format'),
+            'byte_offset': selector.get('byte_offset', selector.get('offset', 0)),
+            'byte_length': selector.get('byte_length', selector.get('length')),
+            'endian': selector.get('endian', 'little'),
+            'signed': selector.get('signed', False),
+            'scale': selector.get('scale', 1),
+            'value_offset': selector.get('value_offset', selector.get('add', 0))
+        })
+    return normalized
+
+
+def load_sensor_selectors():
+    selectors = []
+
+    raw_env = os.environ.get('BLE_GATEWAY_SENSOR_SELECTORS')
+    if raw_env:
+        try:
+            env_payload = json.loads(raw_env)
+            if isinstance(env_payload, dict):
+                env_payload = env_payload.get('selectors', [])
+            if isinstance(env_payload, list):
+                selectors.extend(env_payload)
+            else:
+                logger.warning("BLE_GATEWAY_SENSOR_SELECTORS must be a JSON array or object with 'selectors'")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid BLE_GATEWAY_SENSOR_SELECTORS JSON: {e}")
+
+    file_path = os.environ.get('BLE_GATEWAY_SENSOR_SELECTORS_FILE')
+    if not file_path:
+        default_path = Path.cwd() / 'sensor_selectors.json'
+        if default_path.exists():
+            file_path = str(default_path)
+    if file_path:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as handle:
+                file_payload = json.load(handle)
+            if isinstance(file_payload, dict):
+                file_payload = file_payload.get('selectors', [])
+            if isinstance(file_payload, list):
+                selectors.extend(file_payload)
+            else:
+                logger.warning(f"{file_path} must be a JSON array or object with 'selectors'")
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Failed to load sensor selectors from {file_path}: {e}")
+
+    return _normalize_selectors(selectors)
+
+
+def get_latest_snapshot():
+    """Return a deep copy of the latest data for thread-safe reads"""
+    with LATEST_DATA_LOCK:
+        return copy.deepcopy(latest_data)
+
+
 def init_database():
     """Initialize SQLite database with required tables"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    with DB_WRITE_LOCK:
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
-    # Main device readings table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS device_readings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            device_id TEXT NOT NULL,
-            device_name TEXT,
-            rssi INTEGER,
-            raw_data TEXT
-        )
-    ''')
+        # Main device readings table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS device_readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                device_id TEXT NOT NULL,
+                device_name TEXT,
+                rssi INTEGER,
+                raw_data TEXT
+            )
+        ''')
 
-    # Sensor data table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sensor_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reading_id INTEGER,
-            sensor_type TEXT NOT NULL,
-            sensor_value REAL NOT NULL,
-            unit TEXT,
-            FOREIGN KEY (reading_id) REFERENCES device_readings(id)
-        )
-    ''')
+        # Sensor data table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sensor_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reading_id INTEGER,
+                sensor_type TEXT NOT NULL,
+                sensor_value REAL NOT NULL,
+                unit TEXT,
+                FOREIGN KEY (reading_id) REFERENCES device_readings(id)
+            )
+        ''')
 
-    # Create indices for faster queries
-    cursor.execute('''
-        CREATE INDEX IF NOT EXISTS idx_device_timestamp
-        ON device_readings(device_id, timestamp)
-    ''')
+        # Create indices for faster queries
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_device_timestamp
+            ON device_readings(device_id, timestamp)
+        ''')
 
-    cursor.execute('''
-        CREATE INDEX IF NOT EXISTS idx_sensor_type
-        ON sensor_data(sensor_type, id)
-    ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_sensor_type
+            ON sensor_data(sensor_type, id)
+        ''')
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
 
 
 # Sensor detection patterns (field name -> sensor type, unit)
@@ -456,6 +749,8 @@ SENSOR_PATTERNS = {
     'volt': ('voltage', 'V'),
     'voltage': ('voltage', 'V'),
     'vdd': ('voltage', 'V'),
+    # Energy
+    'energy': ('energy', 'nJ'),
     # Current
     'current': ('current', 'A'),
     'curr': ('current', 'A'),
@@ -470,6 +765,17 @@ SENSOR_PATTERNS = {
     'pm10': ('pm10', 'µg/m³'),
 }
 
+SENSOR_SELECTORS = load_sensor_selectors()
+
+
+def get_supported_sensor_types():
+    types = set(sensor_type for sensor_type, _ in SENSOR_PATTERNS.values())
+    for selector in SENSOR_SELECTORS:
+        sensor_type = selector.get('sensor_type')
+        if sensor_type:
+            types.add(sensor_type)
+    return sorted(types)
+
 
 def detect_sensors(advertising_data, path=''):
     """
@@ -477,6 +783,13 @@ def detect_sensors(advertising_data, path=''):
     Returns list of (sensor_type, value, unit) tuples.
     """
     sensors = []
+
+    if SENSOR_SELECTORS:
+        for selector in SENSOR_SELECTORS:
+            value = _extract_selector_value(advertising_data, selector)
+            if value is None:
+                continue
+            sensors.append((selector['sensor_type'], value, selector['unit']))
 
     if isinstance(advertising_data, dict):
         for key, value in advertising_data.items():
@@ -491,143 +804,251 @@ def detect_sensors(advertising_data, path=''):
                 nested_path = f"{path}.{key}" if path else key
                 sensors.extend(detect_sensors(value, nested_path))
 
-    return sensors
+    if not sensors:
+        return sensors
+
+    deduped = []
+    seen = set()
+    for sensor_type, value, unit in sensors:
+        key = (sensor_type, value, unit)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((sensor_type, value, unit))
+
+    return deduped
 
 
-def save_to_database(device_id, device_name, rssi, advertising_data, sensors=None):
-    """Save device reading and detected sensors to database"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+def _insert_device_reading(cursor, device_id, device_name, rssi, advertising_json, sensors=None):
+    """Insert a device reading and any sensor values using an existing cursor"""
+    cursor.execute('''
+        INSERT INTO device_readings (device_id, device_name, rssi, raw_data)
+        VALUES (?, ?, ?, ?)
+    ''', (device_id, device_name, rssi, advertising_json))
 
-    try:
-        # Insert device reading
-        cursor.execute('''
-            INSERT INTO device_readings (device_id, device_name, rssi, raw_data)
+    reading_id = cursor.lastrowid
+
+    if sensors:
+        rows = [
+            (reading_id, sensor_type, sensor_value, unit)
+            for sensor_type, sensor_value, unit in sensors
+        ]
+        cursor.executemany('''
+            INSERT INTO sensor_data (reading_id, sensor_type, sensor_value, unit)
             VALUES (?, ?, ?, ?)
-        ''', (device_id, device_name, rssi, json.dumps(advertising_data)))
+        ''', rows)
+        logger.debug(f"Saved {len(sensors)} sensor readings for {device_name}")
 
-        reading_id = cursor.lastrowid
+    logger.debug(f"Saved to DB: {device_name} ({device_id})")
 
-        # Insert sensor data if provided
-        if sensors:
-            for sensor_type, sensor_value, unit in sensors:
-                cursor.execute('''
-                    INSERT INTO sensor_data (reading_id, sensor_type, sensor_value, unit)
-                    VALUES (?, ?, ?, ?)
-                ''', (reading_id, sensor_type, sensor_value, unit))
-            logger.debug(f"Saved {len(sensors)} sensor readings for {device_name}")
 
-        conn.commit()
+def save_to_database(device_id, device_name, rssi, advertising_data, sensors=None, cursor=None):
+    """Save device reading and detected sensors to database"""
+    advertising_json = _coerce_advertising_json(advertising_data)
 
-        # Log database write
-        logger.debug(f"Saved to DB: {device_name} ({device_id})")
+    if cursor is not None:
+        _insert_device_reading(cursor, device_id, device_name, rssi, advertising_json, sensors)
+        return
 
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Database error for {device_id}: {str(e)}")
-        raise e
-    finally:
-        conn.close()
+    with DB_WRITE_LOCK:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            _insert_device_reading(cursor, device_id, device_name, rssi, advertising_json, sensors)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Database error for {device_id}: {str(e)}")
+            raise e
+        finally:
+            conn.close()
 
 
 @app.route('/')
 def index():
     """Display the latest BLE device data"""
+    snapshot = get_latest_snapshot()
     return render_template_string(
         HTML_TEMPLATE,
-        devices=latest_data['devices'],
-        device_count=latest_data['count'],
-        last_update=latest_data['timestamp'] or 'Never'
+        devices=snapshot['devices'],
+        device_count=snapshot['count'],
+        last_update=snapshot['timestamp'] or 'Never'
     )
 
 
-def process_ble_data(data, source="HTTP"):
+def process_ble_data(data, source="HTTP", sent_at=None):
     """Process BLE device data from any source (HTTP or MQTT)"""
     try:
         if not data:
             logger.warning(f"Received empty data from {source}")
             return {'error': 'No data received'}, 400
 
-        # Update stored data
-        latest_data['devices'] = data
-        latest_data['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        latest_data['count'] = len(data)
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         # Log incoming data
-        logger.info("=" * 60)
-        logger.info(f"📡 INCOMING DATA ({source}) - {len(data)} device(s)")
-        logger.info("=" * 60)
+        if LOG_COMPACT:
+            logger.info(f"📡 {source} data: {len(data)} device(s)")
+        else:
+            logger.info("=" * 60)
+            logger.info(f"📡 INCOMING DATA ({source}) - {len(data)} device(s)")
+            if sent_at:
+                logger.info(f"📤 Sent at: {sent_at}")
+            logger.info("=" * 60)
 
         total_sensors = 0
+        processed_devices = []
 
         for idx, device in enumerate(data, 1):
             device_id = device.get('id', 'unknown')
-            device_name = device.get('name', 'Unknown')
+            device_name = device.get('name')
+            device_name_display = device_name or 'Unknown'
             rssi = device.get('rssi', 0)
+            ts_ms = device.get('ts_ms', 0)
             advertising = device.get('advertising', {})
 
-            # Log device info
-            logger.info(f"Device {idx}/{len(data)}: {device_name}")
-            logger.info(f"  ID: {device_id}")
-            logger.info(f"  RSSI: {rssi} dBm {'📶' if rssi > -70 else '📡' if rssi > -85 else '📉'}")
+            advertising_safe, advertising_json = normalize_advertising_data(advertising)
+            sensors = detect_sensors(advertising_safe) if advertising_safe else []
 
-            # Detect sensors in advertising data
-            sensors = detect_sensors(advertising) if advertising else []
+            # Log device info
+            rssi_icon = '📶' if rssi > -70 else '📡' if rssi > -85 else '📉'
+            # Calculate device data age
+            if ts_ms > 0:
+                device_time = datetime.fromtimestamp(ts_ms / 1000)
+                now_time = datetime.now()
+                age_seconds = (now_time - device_time).total_seconds()
+                age_str = f" (scanned {age_seconds:.1f}s ago)"
+            else:
+                age_str = ""
+
+            if LOG_COMPACT:
+                logger.info(
+                    f"- {device_id} name={device_name_display} rssi={rssi} dBm {rssi_icon} "
+                    f"sensors={len(sensors)}{age_str}"
+                )
+            else:
+                logger.info(f"Device {idx}/{len(data)}: {device_name_display}")
+                logger.info(f"  ID: {device_id}")
+                logger.info(f"  RSSI: {rssi} dBm {rssi_icon}{age_str}")
 
             if sensors:
-                logger.info(f"  Sensors detected: {len(sensors)}")
-                for sensor_type, sensor_value, unit in sensors:
-                    logger.info(f"    • {sensor_type}: {sensor_value} {unit}")
                 total_sensors += len(sensors)
+                if not LOG_COMPACT:
+                    logger.info(f"  Sensors detected: {len(sensors)}")
+                    for sensor_type, sensor_value, unit in sensors:
+                        logger.info(f"    • {sensor_type}: {sensor_value} {unit}")
 
             # Log raw advertising data if present (debug level)
-            if advertising:
-                logger.debug(f"  Raw advertising data: {json.dumps(advertising, indent=2)}")
+            if advertising_safe:
+                logger.debug(f"  Raw advertising data: {json.dumps(advertising_safe, indent=2)}")
 
-            # Save to database with sensor data
-            save_to_database(device_id, device_name, rssi, advertising, sensors)
+            device_snapshot = dict(device)
+            device_snapshot['advertising'] = advertising_safe
+            processed_devices.append({
+                'device_id': device_id,
+                'device_name': device_name,
+                'rssi': rssi,
+                'advertising_json': advertising_json,
+                'sensors': sensors,
+                'snapshot': device_snapshot
+            })
 
-            logger.info("")  # Blank line between devices
+            if not LOG_COMPACT:
+                logger.info("")  # Blank line between devices
+
+        conn = None
+        try:
+            with DB_WRITE_LOCK:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                for item in processed_devices:
+                    save_to_database(
+                        item['device_id'],
+                        item['device_name'],
+                        item['rssi'],
+                        item['advertising_json'],
+                        item['sensors'],
+                        cursor=cursor
+                    )
+                conn.commit()
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.error(f"Database error during batch save: {str(e)}")
+            raise e
+        finally:
+            if conn:
+                conn.close()
+
+        with LATEST_DATA_LOCK:
+            latest_data['devices'] = [item['snapshot'] for item in processed_devices]
+            latest_data['timestamp'] = timestamp
+            latest_data['count'] = len(processed_devices)
 
         # Summary
-        logger.info(f"✓ Successfully processed {len(data)} device(s), {total_sensors} total sensor reading(s)")
-        logger.info("=" * 60)
+        if LOG_COMPACT:
+            logger.info(f"✓ {source} processed {len(data)} device(s), {total_sensors} sensor reading(s)")
+        else:
+            logger.info(f"✓ Successfully processed {len(data)} device(s), {total_sensors} total sensor reading(s)")
+            logger.info("=" * 60)
 
         return {
             'status': 'success',
             'received': len(data),
             'sensors_detected': total_sensors,
-            'timestamp': latest_data['timestamp']
+            'timestamp': timestamp
         }, 200
 
     except Exception as e:
         logger.error(f"❌ Error processing data from {source}: {str(e)}", exc_info=True)
-        return {'error': str(e)}, 500
+        return {'error': 'Internal server error'}, 500
 
 
 def on_mqtt_connect(client, userdata, flags, rc):
     """Callback when MQTT client connects to broker"""
     if rc == 0:
-        logger.info(f"✓ Connected to MQTT broker: {MQTT_BROKER}")
         # Subscribe with QoS 1 (at least once delivery)
         client.subscribe(MQTT_TOPIC, qos=1)
-        logger.info(f"✓ Subscribed to topic: {MQTT_TOPIC} (QoS 1)")
-        logger.info(f"  (1:1 private connection)")
+        logger.info(f"✓ MQTT connected: {MQTT_BROKER} (topic {MQTT_TOPIC}, QoS 1)")
     else:
-        logger.error(f"❌ Failed to connect to MQTT broker, return code: {rc}")
+        logger.error(f"MQTT connect failed (rc={rc})")
 
 
 def on_mqtt_message(client, userdata, msg):
     """Callback when MQTT message is received"""
     try:
         payload = msg.payload.decode('utf-8')
-        data = json.loads(payload)
-
-        # Process the data (same as HTTP endpoint)
-        if isinstance(data, list):
-            process_ble_data(data, source="MQTT")
+        payload_obj = json.loads(payload)
+        if MQTT_WORKER_ENABLED:
+            try:
+                mqtt_queue.put_nowait(payload_obj)
+            except queue.Full:
+                logger.warning("MQTT worker queue full; dropping message")
         else:
-            logger.warning(f"MQTT message is not a list: {type(data)}")
+            # Fallback: process inline
+            data = None
+            api_key = None
+            sent_at = None
+            if isinstance(payload_obj, list):
+                data = payload_obj
+            elif isinstance(payload_obj, dict):
+                data = payload_obj.get('data') or payload_obj.get('devices')
+                api_key = payload_obj.get('api_key') or payload_obj.get('apiKey')
+                sent_at = payload_obj.get('sent_at')
+
+            if data is None:
+                logger.warning("MQTT message missing device array payload")
+                return
+
+            if MQTT_REQUIRE_API_KEY and api_key != API_KEY:
+                logger.warning("MQTT message missing or invalid api_key")
+                return
+
+            is_valid, error_msg = validate_ble_data(data)
+            if not is_valid:
+                logger.warning(f"MQTT validation failed: {error_msg}")
+                return
+
+            process_ble_data(data, source="MQTT", sent_at=sent_at)
     except json.JSONDecodeError as e:
         logger.error(f"❌ Invalid JSON in MQTT message: {e}")
     except Exception as e:
@@ -637,9 +1058,86 @@ def on_mqtt_message(client, userdata, msg):
 def on_mqtt_disconnect(client, userdata, rc):
     """Callback when MQTT client disconnects"""
     if rc != 0:
-        logger.warning(f"⚠️  Unexpected MQTT disconnection (code: {rc})")
-        logger.info("   MQTT client will automatically reconnect...")
+        logger.warning(f"MQTT disconnected (rc={rc}); reconnecting")
         # paho-mqtt's loop_forever() automatically reconnects
+
+
+def start_mqtt_worker():
+    """Start background worker to process MQTT payloads off the network thread"""
+    global mqtt_worker_thread
+
+    if not MQTT_WORKER_ENABLED:
+        return
+
+    if mqtt_worker_thread and mqtt_worker_thread.is_alive():
+        return
+
+    def worker():
+        while True:
+            payload_obj = mqtt_queue.get()
+            try:
+                data = None
+                api_key = None
+                sent_at = None
+                if isinstance(payload_obj, list):
+                    data = payload_obj
+                elif isinstance(payload_obj, dict):
+                    data = payload_obj.get('data') or payload_obj.get('devices')
+                    api_key = payload_obj.get('api_key') or payload_obj.get('apiKey')
+                    sent_at = payload_obj.get('sent_at')
+
+                if data is None:
+                    logger.warning("MQTT worker: message missing device array payload")
+                    continue
+
+                if MQTT_REQUIRE_API_KEY and api_key != API_KEY:
+                    logger.warning("MQTT worker: missing or invalid api_key")
+                    continue
+
+                is_valid, error_msg = validate_ble_data(data)
+                if not is_valid:
+                    logger.warning(f"MQTT worker validation failed: {error_msg}")
+                    continue
+
+                process_ble_data(data, source="MQTT(worker)", sent_at=sent_at)
+
+                # Stats
+                MQTT_STATS['messages'] += 1
+                MQTT_STATS['devices'] += len(data)
+                now = time.time()
+                elapsed = now - MQTT_STATS['last_log']
+                if elapsed >= MQTT_WORKER_LOG_INTERVAL:
+                    msg_rate = MQTT_STATS['messages'] / elapsed
+                    dev_rate = MQTT_STATS['devices'] / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        f"MQTT worker: {MQTT_STATS['messages']} msg "
+                        f"({msg_rate:.2f}/s), {MQTT_STATS['devices']} devices "
+                        f"({dev_rate:.2f}/s) | queue={mqtt_queue.qsize()}"
+                    )
+                    MQTT_STATS['messages'] = 0
+                    MQTT_STATS['devices'] = 0
+                    MQTT_STATS['last_log'] = now
+
+                if mqtt_queue.qsize() > MQTT_QUEUE_MAXSIZE * 0.8:
+                    logger.warning(
+                        f"MQTT worker queue high water mark: {mqtt_queue.qsize()}/{MQTT_QUEUE_MAXSIZE}"
+                    )
+            except Exception as e:
+                logger.error(f"MQTT worker error: {e}", exc_info=True)
+            finally:
+                mqtt_queue.task_done()
+
+    mqtt_worker_thread = threading.Thread(target=worker, daemon=True)
+    mqtt_worker_thread.start()
+    logger.info("MQTT worker thread started")
+
+
+def mqtt_is_available():
+    try:
+        import paho.mqtt.client as mqtt  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def setup_mqtt():
@@ -663,6 +1161,8 @@ def setup_mqtt():
         mqtt_client.on_connect = on_mqtt_connect
         mqtt_client.on_message = on_mqtt_message
         mqtt_client.on_disconnect = on_mqtt_disconnect
+
+        start_mqtt_worker()
 
         # Set username and password if provided
         if MQTT_USERNAME and MQTT_PASSWORD:
@@ -737,7 +1237,7 @@ def receive_ble_data():
 @apply_rate_limit("60 per minute")
 def get_devices():
     """Get the latest device data as JSON"""
-    return jsonify(latest_data)
+    return jsonify(get_latest_snapshot())
 
 
 @app.route('/health', methods=['GET'])
@@ -746,7 +1246,7 @@ def health_check():
     """Health check endpoint for monitoring"""
     try:
         # Check database connectivity
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT COUNT(*) FROM device_readings')
         reading_count = cursor.fetchone()[0]
@@ -758,7 +1258,11 @@ def health_check():
         reading_count = 0
 
     # Check MQTT status
-    mqtt_status = 'connected' if mqtt_client and mqtt_client.is_connected() else 'disconnected'
+    mqtt_is_connected = False
+    if mqtt_client:
+        is_connected = getattr(mqtt_client, 'is_connected', None)
+        mqtt_is_connected = is_connected() if callable(is_connected) else False
+    mqtt_status = 'connected' if mqtt_is_connected else 'disconnected'
 
     health = {
         'status': 'healthy' if db_status == 'healthy' else 'degraded',
@@ -877,30 +1381,44 @@ def generate_ssl_certificate():
 
 
 def generate_new_connection_id():
-    """Generate a fresh connection ID on every server start"""
+    """Load existing connection ID or generate a new one if not found"""
     global MQTT_CONNECTION_ID, MQTT_TOPIC, MQTT_CLIENT_ID
 
     import secrets
     import time
+
+    conn_id_path = Path(CONNECTION_ID_FILE)
+
+    # Try to load existing connection ID from file
+    if conn_id_path.exists():
+        try:
+            with open(conn_id_path, 'r') as f:
+                stored_id = f.readline().strip()
+                if stored_id and len(stored_id) > 0:
+                    MQTT_CONNECTION_ID = stored_id
+                    MQTT_TOPIC = f"mikrodesign/ble_scan/{MQTT_CONNECTION_ID}"
+                    MQTT_CLIENT_ID = f"ble_gtw_{MQTT_CONNECTION_ID}"
+                    logger.info(f"✓ Loaded existing connection ID: {MQTT_CONNECTION_ID}")
+                    return MQTT_CONNECTION_ID
+        except Exception as e:
+            logger.warning(f"Failed to load connection ID from file: {e}, generating new one")
 
     # Generate new connection ID with timestamp for uniqueness (8 chars + timestamp hash)
     random_part = secrets.token_urlsafe(6)  # ~8 chars
     timestamp_part = hex(int(time.time()))[2:6]  # 4 hex chars from timestamp
     MQTT_CONNECTION_ID = f"{random_part}{timestamp_part}"
 
-    logger.info(f"🔄 Generated NEW connection ID: {MQTT_CONNECTION_ID}")
-    logger.info(f"   Fresh MQTT topic created - old connections are now invalid")
-
     # Set topic and client ID
     MQTT_TOPIC = f"mikrodesign/ble_scan/{MQTT_CONNECTION_ID}"
     MQTT_CLIENT_ID = f"ble_gtw_{MQTT_CONNECTION_ID}"
 
-    # Save to file for reference only (not used for loading)
-    conn_id_path = Path(CONNECTION_ID_FILE)
+    # Save to file for persistence
     with open(conn_id_path, 'w') as f:
         f.write(f"{MQTT_CONNECTION_ID}\n")
         f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Topic: {MQTT_TOPIC}\n")
+
+    logger.info(f"✓ Generated new connection ID: {MQTT_CONNECTION_ID}")
 
     return MQTT_CONNECTION_ID
 
@@ -945,26 +1463,21 @@ if __name__ == '__main__':
         logger.warning(f"Could not fetch public IP: {e}")
         public_ip = "Unable to fetch"
 
-    # Setup MQTT
-    mqtt_enabled = setup_mqtt()
+    mqtt_available = mqtt_is_available()
 
     print("\n" + "=" * 60)
     print("🚀 BLE Gateway Server Starting...")
     print("=" * 60)
 
     # MQTT Configuration
-    print(f"\n📬 MQTT Configuration:")
-    if mqtt_enabled:
-        print(f"   ✓ MQTT Enabled")
+    print(f"\n📬 MQTT:")
+    if mqtt_available:
         print(f"   Broker: {MQTT_BROKER}:{MQTT_PORT} (Server)")
         print(f"   App Port: {MQTT_WEBSOCKET_PORT} (WebSocket)")
         print(f"   Connection ID: {connection_id}")
         print(f"   Topic: {MQTT_TOPIC}")
         if MQTT_USE_TLS:
             print(f"   TLS: Enabled")
-        print(f"\n   🔒 This is a 1:1 private connection")
-        print(f"   🔄 Fresh connection ID generated on each restart")
-        print(f"   💡 Scan the NEW QR code to reconnect your phone")
 
         # Generate QR code with MQTT configuration
         import qrcode
@@ -977,28 +1490,26 @@ if __name__ == '__main__':
             "connection_id": connection_id,
             "tls": MQTT_USE_TLS
         }
+        if MQTT_REQUIRE_API_KEY:
+            mqtt_config["api_key"] = API_KEY
         if MQTT_USERNAME:
             mqtt_config["username"] = MQTT_USERNAME
         if MQTT_PASSWORD:
             mqtt_config["password"] = MQTT_PASSWORD
 
-        config_json = json.dumps(mqtt_config)
+        # Compact JSON + lower error correction keeps the ASCII QR smaller on screen.
+        config_json = json.dumps(mqtt_config, separators=(',', ':'))
 
         # Generate QR code
-        qr = qrcode.QRCode(border=1)
+        qr = qrcode.QRCode(
+            border=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+        )
         qr.add_data(config_json)
         qr.make()
 
-        print(f"\n   📱 Scan this QR code with your Android app:")
-        print()
+        print(f"\n   📱 QR:")
         qr.print_ascii(invert=True)
-        print()
-        print(f"   ✓ Instant 1:1 connection setup!")
-
-        print(f"\n   📱 Or configure manually:")
-        print(f"      Broker: {MQTT_BROKER}")
-        print(f"      Port: {MQTT_WEBSOCKET_PORT} (WebSocket)")
-        print(f"      Topic: {MQTT_TOPIC}")
     else:
         print(f"   ✗ MQTT Disabled (paho-mqtt not installed)")
         print(f"   Install with: pip install paho-mqtt")
@@ -1047,22 +1558,13 @@ if __name__ == '__main__':
         print(f"   ⚠️  Anyone can access the API!")
         print(f"   Enable with: export BLE_GATEWAY_AUTH_ENABLED=true")
     print("=" * 60)
-
-    # Show supported sensor types
-    sensor_types = sorted(set(sensor_type for sensor_type, _ in SENSOR_PATTERNS.values()))
-    print(f"\n📡 Supported sensor types:")
-    sensor_lines = []
-    for i in range(0, len(sensor_types), 4):
-        line = ', '.join(sensor_types[i:i+4])
-        sensor_lines.append(f"   {line}")
-    for line in sensor_lines:
-        print(line)
-
-    print("=" * 60)
     print(f"📝 Logging to: ble_gateway.log")
     print("💾 Database:   ble_gateway.db")
     print("=" * 60)
     print("\nPress Ctrl+C to stop\n")
+
+    if mqtt_available:
+        setup_mqtt()
 
     logger.info("Server started successfully")
 

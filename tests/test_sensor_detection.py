@@ -1,6 +1,8 @@
 """
 Unit tests for sensor detection functionality
 """
+import base64
+import json
 import pytest
 import sys
 from pathlib import Path
@@ -126,6 +128,111 @@ class TestSensorDetection:
         }
         sensors = ble_gtw_server.detect_sensors(data)
         assert len(sensors) == 3
+
+
+@pytest.mark.unit
+class TestSensorSelectors:
+    """Tests for configurable sensor selectors"""
+
+    def test_selector_extracts_numeric_path(self, monkeypatch):
+        selectors = [{
+            "sensor_type": "temperature",
+            "unit": "C",
+            "path": "metrics.t1",
+            "scale": 0.1
+        }]
+        monkeypatch.setenv("BLE_GATEWAY_SENSOR_SELECTORS", json.dumps(selectors))
+        loaded = ble_gtw_server.load_sensor_selectors()
+        monkeypatch.setattr(ble_gtw_server, "SENSOR_SELECTORS", loaded)
+
+        data = {"metrics": {"t1": 250}}
+        sensors = ble_gtw_server.detect_sensors(data)
+        assert any(s[0] == "temperature" and s[1] == 25.0 and s[2] == "C" for s in sensors)
+
+    def test_selector_extracts_bytes(self, monkeypatch):
+        selectors = [{
+            "sensor_type": "energy",
+            "unit": "nJ",
+            "path": "rawData",
+            "format": "u16le",
+            "byte_offset": 2
+        }]
+        monkeypatch.setenv("BLE_GATEWAY_SENSOR_SELECTORS", json.dumps(selectors))
+        loaded = ble_gtw_server.load_sensor_selectors()
+        monkeypatch.setattr(ble_gtw_server, "SENSOR_SELECTORS", loaded)
+
+        data = {"rawData": [0x34, 0x12, 0x10, 0x00]}
+        sensors = ble_gtw_server.detect_sensors(data)
+        assert any(s[0] == "energy" and s[1] == 16 and s[2] == "nJ" for s in sensors)
+
+
+@pytest.mark.unit
+class TestSelectorHelpers:
+    """Tests for selector helper utilities"""
+
+    def test_extract_path_value(self):
+        data = {"a": {"b": [{"c": 1}]}}
+        assert ble_gtw_server._extract_path_value(data, "a.b.0.c") == 1
+        assert ble_gtw_server._extract_path_value(data, "a.b.1.c") is None
+        assert ble_gtw_server._extract_path_value(data, "a.b.x") is None
+
+    def test_coerce_bytes_variants(self):
+        raw = b"\x01\x02\x03"
+        assert ble_gtw_server._coerce_bytes([1, 2, 3]) == raw
+        assert ble_gtw_server._coerce_bytes({"bytes": [1, 2, 3]}) == raw
+        assert ble_gtw_server._coerce_bytes("0x010203") == raw
+        assert ble_gtw_server._coerce_bytes(base64.b64encode(raw).decode("ascii")) == raw
+        assert ble_gtw_server._coerce_bytes({"unknown": "data"}) is None
+        assert ble_gtw_server._coerce_bytes([1, "x"]) is None
+
+    def test_decode_helpers(self):
+        data = b"\x10\x00\x00\x01"
+        assert ble_gtw_server._decode_with_format(data, "u16le") == 16
+        assert ble_gtw_server._decode_with_format(data, "u16le", byte_offset=2) == 256
+        assert ble_gtw_server._decode_with_format(data, "nope") is None
+        assert ble_gtw_server._decode_bytes(data, byte_length=None) is None
+        assert ble_gtw_server._decode_bytes(data, byte_offset=-1, byte_length=1) is None
+        assert ble_gtw_server._decode_bytes(data, byte_offset=4, byte_length=1) is None
+        assert ble_gtw_server._decode_bytes(data, byte_offset=0, byte_length=2, endian="big") == 4096
+
+    def test_extract_selector_value(self):
+        selector = {
+            "sensor_type": "temperature",
+            "unit": "C",
+            "path": "metrics.t",
+            "scale": 0.1,
+            "value_offset": 1
+        }
+        data = {"metrics": {"t": 250}}
+        assert ble_gtw_server._extract_selector_value(data, selector) == 26.0
+
+        byte_selector = {
+            "sensor_type": "energy",
+            "unit": "nJ",
+            "path": "rawData",
+            "format": "u16le",
+            "byte_offset": 1
+        }
+        data = {"rawData": [0x00, 0x10, 0x00]}
+        assert ble_gtw_server._extract_selector_value(data, byte_selector) == 16
+
+        missing_selector = {"sensor_type": "energy", "unit": "nJ", "path": "missing"}
+        assert ble_gtw_server._extract_selector_value({}, missing_selector) is None
+
+    def test_load_sensor_selectors_and_supported_types(self, monkeypatch, tmp_path):
+        env_selectors = [{"sensor_type": "turbidity", "unit": "ntu", "path": "metrics.t"}]
+        file_selectors = {"selectors": [{"sensor_type": "energy", "unit": "nJ", "path": "rawData", "format": "u16le"}]}
+        file_path = tmp_path / "selectors.json"
+        file_path.write_text(json.dumps(file_selectors))
+
+        monkeypatch.setenv("BLE_GATEWAY_SENSOR_SELECTORS", json.dumps(env_selectors))
+        monkeypatch.setenv("BLE_GATEWAY_SENSOR_SELECTORS_FILE", str(file_path))
+        selectors = ble_gtw_server.load_sensor_selectors()
+        assert len(selectors) == 2
+
+        monkeypatch.setattr(ble_gtw_server, "SENSOR_SELECTORS", selectors)
+        supported = ble_gtw_server.get_supported_sensor_types()
+        assert "turbidity" in supported
 
 
 @pytest.mark.unit

@@ -270,8 +270,8 @@ class MultiPacketBLEReceiver:
 
     def _parse_packet_header(self, data_bytes: bytes) -> Optional[Dict]:
         """Parse packet header and extract fields"""
-        # Minimum packet size: header (10 bytes) + at least some payload
-        if len(data_bytes) < 10:
+        # Minimum packet size: header (16 bytes) + at least some payload
+        if len(data_bytes) < 16:
             logger.debug(f"Packet too short: {len(data_bytes)} bytes")
             return None
 

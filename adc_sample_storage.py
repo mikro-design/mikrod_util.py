@@ -23,9 +23,8 @@ def init_adc_storage(db_file='ble_gateway.db'):
     try:
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
-        
-        # Create ADC samples table
-        cursor.execute('''
+
+        table_schema = '''
             CREATE TABLE IF NOT EXISTS adc_measurements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -34,10 +33,30 @@ def init_adc_storage(db_file='ble_gateway.db'):
                 sample_count INTEGER,
                 samples TEXT,
                 stats TEXT,
-                raw_bytes BLOB,
-                FOREIGN KEY (device_id) REFERENCES device_readings(device_id)
+                raw_bytes BLOB
             )
+        '''
+
+        # Migrate old schema with invalid foreign key if needed
+        cursor.execute('''
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='adc_measurements'
         ''')
+        table_exists = cursor.fetchone() is not None
+        if table_exists:
+            cursor.execute('PRAGMA foreign_key_list(adc_measurements)')
+            if cursor.fetchall():
+                cursor.execute('ALTER TABLE adc_measurements RENAME TO adc_measurements_old')
+                cursor.execute(table_schema)
+                cursor.execute('''
+                    INSERT INTO adc_measurements
+                    (id, timestamp, device_id, stream_id, sample_count, samples, stats, raw_bytes)
+                    SELECT id, timestamp, device_id, stream_id, sample_count, samples, stats, raw_bytes
+                    FROM adc_measurements_old
+                ''')
+                cursor.execute('DROP TABLE adc_measurements_old')
+        else:
+            cursor.execute(table_schema)
         
         # Create index for fast queries
         cursor.execute('''

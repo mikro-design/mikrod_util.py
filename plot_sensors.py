@@ -13,6 +13,22 @@ from pathlib import Path
 DB_FILE = 'ble_gateway.db'
 
 
+def _format_time_axis(ax):
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    ax.tick_params(axis='x', rotation=45)
+
+
+def _ensure_positive_refresh(refresh_seconds):
+    if refresh_seconds is None:
+        return 1.0
+    try:
+        refresh = float(refresh_seconds)
+    except (TypeError, ValueError):
+        return 1.0
+    return 0.1 if refresh <= 0 else refresh
+
+
 def get_available_devices(conn):
     """Get list of devices that have sensor data"""
     cursor = conn.cursor()
@@ -51,7 +67,8 @@ def get_sensor_types(conn, device_id=None):
 def get_sensor_data(conn, sensor_type, device_id=None, hours=24):
     """Retrieve sensor data for plotting"""
     cursor = conn.cursor()
-    time_limit = datetime.now() - timedelta(hours=hours)
+    # SQLite CURRENT_TIMESTAMP is UTC; align comparisons to UTC.
+    time_limit = datetime.utcnow() - timedelta(hours=hours)
 
     if device_id:
         cursor.execute('''
@@ -112,24 +129,25 @@ def get_raw_field_data(conn, field_path, device_id=None, hours=24):
     import json
 
     cursor = conn.cursor()
-    time_limit = datetime.now() - timedelta(hours=hours)
+    # SQLite CURRENT_TIMESTAMP is UTC; align comparisons to UTC.
+    time_limit = datetime.utcnow() - timedelta(hours=hours)
 
     if device_id:
         cursor.execute('''
             SELECT timestamp, raw_data, device_name, device_id
             FROM device_readings
             WHERE device_id = ? AND timestamp >= ?
-            ORDER BY timestamp
         ''', (device_id, time_limit))
     else:
         cursor.execute('''
             SELECT timestamp, raw_data, device_name, device_id
             FROM device_readings
             WHERE timestamp >= ?
-            ORDER BY timestamp
         ''', (time_limit,))
 
     rows = cursor.fetchall()
+    # Sort in Python to avoid SQLite temp file issues on large datasets.
+    rows.sort(key=lambda row: row[0])
     result = []
 
     for row in rows:
@@ -174,9 +192,7 @@ def plot_multiple_fields(conn, field_paths, device_id=None, hours=24, save_path=
     ax.set_title(title, fontsize=14, fontweight='bold')
 
     # Format x-axis
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
-    plt.xticks(rotation=45)
+    _format_time_axis(ax)
 
     # Legend
     ax.legend(loc='best')
@@ -197,58 +213,101 @@ def plot_multiple_fields(conn, field_paths, device_id=None, hours=24, save_path=
     plt.close()
 
 
-def plot_sensor_data(sensor_type, data, device_name=None, save_path=None):
-    """Create a plot for sensor data"""
-    if not data:
-        print(f"No data available for {sensor_type}")
-        return
+def render_multi_field_plot(ax, field_paths, data_map, device_id=None):
+    """Render multiple advertising fields onto an existing axis."""
+    ax.clear()
 
-    # Parse timestamps and values
-    timestamps = [datetime.fromisoformat(row[0]) for row in data]
-    values = [row[1] for row in data]
-    unit = data[0][2] if len(data[0]) > 2 else ''
+    colors = ['#007AFF', '#34C759', '#FF9500', '#FF3B30', '#5856D6', '#AF52DE', '#FF2D55', '#64D2FF']
+    any_data = False
 
-    # Group by device if multiple devices
-    if len(data[0]) > 3:
-        devices = {}
-        for row in data:
-            dev_id = row[4] if len(row) > 4 else row[3]
-            if dev_id not in devices:
-                devices[dev_id] = {'timestamps': [], 'values': [], 'name': row[3]}
-            devices[dev_id]['timestamps'].append(datetime.fromisoformat(row[0]))
-            devices[dev_id]['values'].append(row[1])
+    for idx, field_path in enumerate(field_paths):
+        data = data_map.get(field_path, [])
+        if not data:
+            continue
 
-        # Create plot
-        fig, ax = plt.subplots(figsize=(12, 6))
-
-        for dev_id, dev_data in devices.items():
-            ax.plot(dev_data['timestamps'], dev_data['values'],
-                   marker='o', linestyle='-', linewidth=1.5, markersize=4,
-                   label=dev_data['name'], alpha=0.7)
-
-        ax.legend()
-    else:
-        # Single device plot
-        fig, ax = plt.subplots(figsize=(12, 6))
+        any_data = True
+        timestamps = [datetime.fromisoformat(row[0]) for row in data]
+        values = [row[1] for row in data]
+        color = colors[idx % len(colors)]
         ax.plot(timestamps, values, marker='o', linestyle='-',
-               linewidth=2, markersize=4, color='#007AFF', alpha=0.7)
+               linewidth=1.5, markersize=4, color=color, alpha=0.7,
+               label=field_path)
 
-    # Format plot
+    title = 'Multiple Advertising Data Fields over Time'
+    if device_id:
+        title += f' - {device_id}'
+    ax.set_title(title, fontsize=14, fontweight='bold')
     ax.set_xlabel('Time', fontsize=12)
-    ax.set_ylabel(f'{sensor_type.capitalize()} ({unit})', fontsize=12)
+    ax.set_ylabel('Value', fontsize=12)
+
+    if not any_data:
+        ax.text(0.5, 0.5, 'No data available for selected fields', transform=ax.transAxes,
+                ha='center', va='center')
+    else:
+        ax.legend(loc='best')
+
+    _format_time_axis(ax)
+    ax.grid(True, alpha=0.3, linestyle='--')
+
+
+def render_sensor_plot(ax, sensor_type, data, device_name=None):
+    """Render sensor/field data onto an existing axis."""
+    ax.clear()
+
+    unit = data[0][2] if data else ''
+    ylabel = f'{sensor_type.capitalize()} ({unit})' if unit else f'{sensor_type.capitalize()}'
+
+    ax.set_xlabel('Time', fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
 
     title = f'{sensor_type.capitalize()} over Time'
     if device_name:
         title += f' - {device_name}'
     ax.set_title(title, fontsize=14, fontweight='bold')
 
-    # Format x-axis
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
-    plt.xticks(rotation=45)
+    if not data:
+        ax.text(0.5, 0.5, f'No data available for {sensor_type}', transform=ax.transAxes,
+                ha='center', va='center')
+        _format_time_axis(ax)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        return
 
-    # Grid
+    # Group by device if multiple devices present
+    if len(data[0]) > 3:
+        devices = {}
+        for row in data:
+            dev_id = row[4] if len(row) > 4 else row[3]
+            dev_name = row[3] or dev_id or 'Unknown'
+            if dev_id not in devices:
+                devices[dev_id] = {'timestamps': [], 'values': [], 'name': dev_name}
+            devices[dev_id]['timestamps'].append(datetime.fromisoformat(row[0]))
+            devices[dev_id]['values'].append(row[1])
+
+        for dev_id, dev_data in devices.items():
+            ax.plot(dev_data['timestamps'], dev_data['values'],
+                   marker='o', linestyle='-', linewidth=1.5, markersize=4,
+                   label=dev_data['name'], alpha=0.7)
+
+        if len(devices) > 1:
+            ax.legend()
+    else:
+        timestamps = [datetime.fromisoformat(row[0]) for row in data]
+        values = [row[1] for row in data]
+        ax.plot(timestamps, values, marker='o', linestyle='-',
+               linewidth=2, markersize=4, color='#007AFF', alpha=0.7)
+
+    _format_time_axis(ax)
     ax.grid(True, alpha=0.3, linestyle='--')
+
+
+def plot_sensor_data(sensor_type, data, device_name=None, save_path=None):
+    """Create a plot for sensor data"""
+    if not data:
+        print(f"No data available for {sensor_type}")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    render_sensor_plot(ax, sensor_type, data, device_name)
 
     # Tight layout
     plt.tight_layout()
@@ -263,59 +322,70 @@ def plot_sensor_data(sensor_type, data, device_name=None, save_path=None):
     plt.close()
 
 
-def plot_rssi(conn, device_id=None, hours=24, save_path=None):
-    """Plot RSSI (signal strength) over time"""
+def get_rssi_data(conn, device_id=None, hours=24):
+    """Fetch RSSI data for plotting"""
     cursor = conn.cursor()
-    time_limit = datetime.now() - timedelta(hours=hours)
+    # SQLite CURRENT_TIMESTAMP is UTC; align comparisons to UTC.
+    time_limit = datetime.utcnow() - timedelta(hours=hours)
 
     if device_id:
         cursor.execute('''
             SELECT timestamp, rssi, device_name
             FROM device_readings
             WHERE device_id = ? AND timestamp >= ?
-            ORDER BY timestamp
         ''', (device_id, time_limit))
-        title_suffix = f" - {cursor.fetchone()[2] if cursor.rowcount > 0 else device_id}"
-        cursor.execute('''
-            SELECT timestamp, rssi, device_name
-            FROM device_readings
-            WHERE device_id = ? AND timestamp >= ?
-            ORDER BY timestamp
-        ''', (device_id, time_limit))
+        data = cursor.fetchall()
+        data.sort(key=lambda row: row[0])
+        device_name = data[0][2] if data and data[0][2] else device_id
+        title_suffix = f" - {device_name}" if data else ""
     else:
         cursor.execute('''
             SELECT timestamp, rssi, device_name, device_id
             FROM device_readings
             WHERE timestamp >= ?
-            ORDER BY timestamp
         ''', (time_limit,))
+        data = cursor.fetchall()
+        data.sort(key=lambda row: row[0])
         title_suffix = ""
 
-    data = cursor.fetchall()
+    return data, title_suffix
+
+def render_rssi_plot(ax, data, title_suffix="", device_id=None):
+    """Render RSSI data onto an existing axis."""
+    ax.clear()
 
     if not data:
-        print("No RSSI data available")
+        ax.set_title('Signal Strength over Time', fontsize=14, fontweight='bold')
+        ax.text(0.5, 0.5, 'No RSSI data available', transform=ax.transAxes,
+                ha='center', va='center')
+        _format_time_axis(ax)
+        ax.grid(True, alpha=0.3, linestyle='--')
         return
 
-    # Group by device
-    devices = {}
-    for row in data:
-        dev_id = row[3] if len(row) > 3 else device_id
-        if dev_id not in devices:
-            devices[dev_id] = {'timestamps': [], 'values': [], 'name': row[2]}
-        devices[dev_id]['timestamps'].append(datetime.fromisoformat(row[0]))
-        devices[dev_id]['values'].append(row[1])
+    if len(data[0]) > 3:
+        devices = {}
+        for row in data:
+            dev_id = row[3]
+            dev_name = row[2] or dev_id or 'Unknown'
+            if dev_id not in devices:
+                devices[dev_id] = {'timestamps': [], 'values': [], 'name': dev_name}
+            devices[dev_id]['timestamps'].append(datetime.fromisoformat(row[0]))
+            devices[dev_id]['values'].append(row[1])
 
-    # Create plot
-    fig, ax = plt.subplots(figsize=(12, 6))
+        for dev_id, dev_data in devices.items():
+            ax.plot(dev_data['timestamps'], dev_data['values'],
+                   marker='o', linestyle='-', linewidth=1.5, markersize=4,
+                   label=dev_data['name'], alpha=0.7)
 
-    for dev_id, dev_data in devices.items():
-        ax.plot(dev_data['timestamps'], dev_data['values'],
-               marker='o', linestyle='-', linewidth=1.5, markersize=4,
-               label=dev_data['name'], alpha=0.7)
-
-    if len(devices) > 1:
-        ax.legend()
+        if len(devices) > 1:
+            ax.legend()
+    else:
+        timestamps = [datetime.fromisoformat(row[0]) for row in data]
+        values = [row[1] for row in data]
+        label = data[0][2] or device_id
+        ax.plot(timestamps, values, marker='o', linestyle='-',
+               linewidth=2, markersize=4, color='#007AFF', alpha=0.7,
+               label=label)
 
     # Format plot
     ax.set_xlabel('Time', fontsize=12)
@@ -323,14 +393,26 @@ def plot_rssi(conn, device_id=None, hours=24, save_path=None):
     ax.set_title(f'Signal Strength over Time{title_suffix}', fontsize=14, fontweight='bold')
 
     # Format x-axis
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
-    plt.xticks(rotation=45)
+    _format_time_axis(ax)
 
     # Grid and reference lines
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.axhline(y=-70, color='green', linestyle='--', alpha=0.5, label='Good')
     ax.axhline(y=-85, color='orange', linestyle='--', alpha=0.5, label='Medium')
+
+    if len(data[0]) <= 3 and label:
+        ax.legend()
+
+
+def plot_rssi(conn, device_id=None, hours=24, save_path=None):
+    """Plot RSSI (signal strength) over time"""
+    data, title_suffix = get_rssi_data(conn, device_id, hours)
+    if not data:
+        print("No RSSI data available")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    render_rssi_plot(ax, data, title_suffix, device_id)
 
     # Tight layout
     plt.tight_layout()
@@ -343,6 +425,135 @@ def plot_rssi(conn, device_id=None, hours=24, save_path=None):
         plt.show()
 
     plt.close()
+
+
+def _run_live_loop(fetch_data, render, refresh_seconds, max_iterations=None):
+    refresh = _ensure_positive_refresh(refresh_seconds)
+
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(12, 6))
+    iterations = 0
+    backend = str(plt.get_backend())
+    backend_key = backend.lower()
+    if backend_key == 'agg':
+        print(f"Live plotting requires an interactive backend (current: {backend}).")
+        print("Try: MPLBACKEND=TkAgg python3 plot_sensors.py ... --live")
+    else:
+        plt.show(block=False)
+
+    try:
+        while True:
+            data = fetch_data()
+            render(ax, data)
+            fig.tight_layout()
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+
+            iterations += 1
+            if max_iterations is not None and iterations >= max_iterations:
+                break
+
+            plt.pause(refresh)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        plt.ioff()
+        plt.close(fig)
+
+
+def live_plot_field(db_path, field_path, device_id=None, hours=24, refresh_seconds=5, max_iterations=None):
+    """Live plot for an advertising data field."""
+
+    def fetch_data():
+        try:
+            conn = sqlite3.connect(db_path)
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return []
+        try:
+            return get_raw_field_data(conn, field_path, device_id, hours)
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return []
+        finally:
+            conn.close()
+
+    def render(ax, data):
+        device_name = data[0][3] if device_id and data else None
+        render_sensor_plot(ax, field_path, data, device_name)
+
+    _run_live_loop(fetch_data, render, refresh_seconds, max_iterations=max_iterations)
+
+
+def live_plot_fields(db_path, field_paths, device_id=None, hours=24, refresh_seconds=5, max_iterations=None):
+    """Live plot for multiple advertising data fields."""
+
+    def fetch_data():
+        try:
+            conn = sqlite3.connect(db_path)
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return {}
+        try:
+            return {field: get_raw_field_data(conn, field, device_id, hours) for field in field_paths}
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return {}
+        finally:
+            conn.close()
+
+    def render(ax, data_map):
+        render_multi_field_plot(ax, field_paths, data_map, device_id)
+
+    _run_live_loop(fetch_data, render, refresh_seconds, max_iterations=max_iterations)
+
+
+def live_plot_sensor(db_path, sensor_type, device_id=None, hours=24, refresh_seconds=5, max_iterations=None):
+    """Live plot for a sensor_data stream."""
+
+    def fetch_data():
+        try:
+            conn = sqlite3.connect(db_path)
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return []
+        try:
+            return get_sensor_data(conn, sensor_type, device_id, hours)
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return []
+        finally:
+            conn.close()
+
+    def render(ax, data):
+        device_name = data[0][3] if device_id and data else None
+        render_sensor_plot(ax, sensor_type, data, device_name)
+
+    _run_live_loop(fetch_data, render, refresh_seconds, max_iterations=max_iterations)
+
+
+def live_plot_rssi(db_path, device_id=None, hours=24, refresh_seconds=5, max_iterations=None):
+    """Live plot for RSSI data."""
+
+    def fetch_data():
+        try:
+            conn = sqlite3.connect(db_path)
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return ([], "")
+        try:
+            return get_rssi_data(conn, device_id, hours)
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return ([], "")
+        finally:
+            conn.close()
+
+    def render(ax, payload):
+        data, title_suffix = payload
+        render_rssi_plot(ax, data, title_suffix, device_id)
+
+    _run_live_loop(fetch_data, render, refresh_seconds, max_iterations=max_iterations)
 
 
 def clear_database(conn):
@@ -519,6 +730,8 @@ Examples:
   %(prog)s --rssi --device XX --hours 12          Plot RSSI for device, last 12 hours
   %(prog)s --fields rawData.5 rawData.6 --save plot.png  Save to file
   %(prog)s --sensor temperature                   Plot from sensor_data table (legacy)
+  %(prog)s --field rawData.10 --device XX --live  Live plot (auto-refresh)
+  %(prog)s --fields rawData.8 rawData.9 rawData.10 --device XX --live  Live multi-field plot
         '''
     )
 
@@ -538,6 +751,10 @@ Examples:
                        help='Filter by device ID')
     parser.add_argument('--hours', type=int, default=24,
                        help='Hours of data to plot (default: 24)')
+    parser.add_argument('--live', action='store_true',
+                       help='Live plot with auto-refresh')
+    parser.add_argument('--refresh', type=float, default=5,
+                       help='Refresh interval in seconds for live mode (default: 5)')
     parser.add_argument('--save', type=str,
                        help='Save plot to file instead of displaying')
     parser.add_argument('--db', type=str, default=DB_FILE,
@@ -551,10 +768,30 @@ Examples:
         print("Make sure the BLE gateway server has been run first.")
         sys.exit(1)
 
-    # Connect to database
-    conn = sqlite3.connect(args.db)
-
     try:
+        if args.live:
+            if args.save:
+                print("Note: --save is ignored in live mode.")
+
+            if args.fields:
+                live_plot_fields(args.db, args.fields, args.device, args.hours, args.refresh)
+                return
+            if args.field:
+                live_plot_field(args.db, args.field, args.device, args.hours, args.refresh)
+                return
+            if args.sensor:
+                live_plot_sensor(args.db, args.sensor, args.device, args.hours, args.refresh)
+                return
+            if args.rssi:
+                live_plot_rssi(args.db, args.device, args.hours, args.refresh)
+                return
+
+            print("Live mode requires --field, --sensor, or --rssi.")
+            return
+
+        # Connect to database
+        conn = sqlite3.connect(args.db)
+
         # Clear database
         if args.clear:
             clear_database(conn)
@@ -597,7 +834,8 @@ Examples:
         parser.print_help()
 
     finally:
-        conn.close()
+        if 'conn' in locals():
+            conn.close()
 
 
 if __name__ == '__main__':
